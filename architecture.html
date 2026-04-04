@@ -1,0 +1,557 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Smart LBSS 系统架构</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;600&family=Noto+Sans+SC:wght@300;400;500;700&family=Space+Mono:wght@400;700&display=swap');
+
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #0a0e17;
+    color: #c8d6e5;
+    font-family: 'Noto Sans SC', sans-serif;
+    min-height: 100vh;
+    padding: 40px 20px;
+    overflow-x: hidden;
+  }
+
+  body::before {
+    content: '';
+    position: fixed;
+    inset: 0;
+    background:
+      radial-gradient(ellipse 80% 50% at 50% 0%, rgba(56, 189, 248, 0.06) 0%, transparent 60%),
+      radial-gradient(ellipse 60% 40% at 80% 100%, rgba(16, 185, 129, 0.05) 0%, transparent 50%);
+    pointer-events: none;
+    z-index: 0;
+  }
+
+  .container {
+    max-width: 1200px;
+    margin: 0 auto;
+    position: relative;
+    z-index: 1;
+  }
+
+  h1 {
+    text-align: center;
+    font-size: 2rem;
+    font-weight: 700;
+    color: #f0f4f8;
+    margin-bottom: 8px;
+    letter-spacing: -0.02em;
+  }
+
+  .subtitle {
+    text-align: center;
+    font-size: 0.9rem;
+    color: #64748b;
+    margin-bottom: 48px;
+    font-weight: 300;
+  }
+
+  /* Layer sections */
+  .layer {
+    position: relative;
+    margin-bottom: 0;
+    padding: 28px 32px;
+    border-radius: 16px;
+    background: rgba(15, 23, 42, 0.6);
+    border: 1px solid rgba(100, 116, 139, 0.15);
+    backdrop-filter: blur(12px);
+  }
+
+  .layer-label {
+    position: absolute;
+    left: -2px;
+    top: 50%;
+    transform: translateY(-50%) rotate(-90deg);
+    font-family: 'Space Mono', monospace;
+    font-size: 0.65rem;
+    font-weight: 700;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    white-space: nowrap;
+    padding: 6px 12px;
+    border-radius: 4px;
+  }
+
+  .layer-edge .layer-label { color: #f59e0b; background: rgba(245, 158, 11, 0.1); }
+  .layer-agg .layer-label { color: #38bdf8; background: rgba(56, 189, 248, 0.1); }
+  .layer-cloud .layer-label { color: #a78bfa; background: rgba(167, 139, 250, 0.1); }
+
+  .layer-title {
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: 20px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .layer-edge .layer-title { color: #f59e0b; }
+  .layer-agg .layer-title { color: #38bdf8; }
+  .layer-cloud .layer-title { color: #a78bfa; }
+
+  .layer-title::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: linear-gradient(90deg, currentColor 0%, transparent 100%);
+    opacity: 0.3;
+  }
+
+  .modules-row {
+    display: flex;
+    gap: 20px;
+    flex-wrap: wrap;
+    justify-content: center;
+  }
+
+  /* Module cards */
+  .module {
+    flex: 1;
+    min-width: 220px;
+    max-width: 340px;
+    background: rgba(30, 41, 59, 0.5);
+    border: 1px solid rgba(100, 116, 139, 0.2);
+    border-radius: 12px;
+    padding: 20px;
+    position: relative;
+    overflow: hidden;
+    transition: transform 0.3s ease, border-color 0.3s ease;
+  }
+
+  .module:hover {
+    transform: translateY(-2px);
+    border-color: rgba(100, 116, 139, 0.4);
+  }
+
+  .module::before {
+    content: '';
+    position: absolute;
+    top: 0;
+    left: 0;
+    right: 0;
+    height: 3px;
+    border-radius: 12px 12px 0 0;
+  }
+
+  .layer-edge .module::before { background: linear-gradient(90deg, #f59e0b, #f97316); }
+  .layer-agg .module::before { background: linear-gradient(90deg, #38bdf8, #06b6d4); }
+  .layer-cloud .module::before { background: linear-gradient(90deg, #a78bfa, #818cf8); }
+
+  .module-icon {
+    width: 36px;
+    height: 36px;
+    border-radius: 8px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 1.1rem;
+    margin-bottom: 12px;
+  }
+
+  .layer-edge .module-icon { background: rgba(245, 158, 11, 0.12); }
+  .layer-agg .module-icon { background: rgba(56, 189, 248, 0.12); }
+  .layer-cloud .module-icon { background: rgba(167, 139, 250, 0.12); }
+
+  .module-name {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.85rem;
+    font-weight: 600;
+    color: #e2e8f0;
+    margin-bottom: 4px;
+  }
+
+  .module-device {
+    font-size: 0.7rem;
+    color: #64748b;
+    margin-bottom: 12px;
+    font-family: 'JetBrains Mono', monospace;
+  }
+
+  .module-desc {
+    font-size: 0.8rem;
+    line-height: 1.6;
+    color: #94a3b8;
+    margin-bottom: 14px;
+  }
+
+  .module-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+  }
+
+  .tag {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.6rem;
+    padding: 3px 8px;
+    border-radius: 4px;
+    background: rgba(100, 116, 139, 0.15);
+    color: #94a3b8;
+    letter-spacing: 0.03em;
+  }
+
+  /* Connection arrows between layers */
+  .connector {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    padding: 16px 0 8px;
+    position: relative;
+  }
+
+  .connector-line {
+    width: 2px;
+    height: 32px;
+    position: relative;
+  }
+
+  .connector-line::before {
+    content: '';
+    position: absolute;
+    inset: 0;
+    background: linear-gradient(180deg, rgba(100, 116, 139, 0.3), rgba(100, 116, 139, 0.1));
+  }
+
+  .connector-label {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.6rem;
+    color: #64748b;
+    background: rgba(15, 23, 42, 0.8);
+    padding: 4px 12px;
+    border-radius: 4px;
+    border: 1px solid rgba(100, 116, 139, 0.2);
+    margin-top: -1px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .connector-label .proto {
+    color: #10b981;
+    font-weight: 600;
+  }
+
+  .arrow-down {
+    display: inline-block;
+    color: #475569;
+    font-size: 0.7rem;
+  }
+
+  /* Data flow section */
+  .flow-section {
+    margin-top: 48px;
+    padding: 28px 32px;
+    border-radius: 16px;
+    background: rgba(15, 23, 42, 0.6);
+    border: 1px solid rgba(100, 116, 139, 0.15);
+  }
+
+  .flow-title {
+    font-size: 0.75rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    color: #10b981;
+    margin-bottom: 24px;
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  .flow-title::after {
+    content: '';
+    flex: 1;
+    height: 1px;
+    background: linear-gradient(90deg, rgba(16, 185, 129, 0.3), transparent);
+  }
+
+  .flow-steps {
+    display: flex;
+    flex-direction: column;
+    gap: 0;
+  }
+
+  .flow-step {
+    display: flex;
+    align-items: flex-start;
+    gap: 16px;
+    position: relative;
+  }
+
+  .flow-step-line {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    width: 24px;
+    flex-shrink: 0;
+  }
+
+  .flow-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    background: #10b981;
+    flex-shrink: 0;
+    box-shadow: 0 0 8px rgba(16, 185, 129, 0.4);
+  }
+
+  .flow-vert {
+    width: 2px;
+    height: 24px;
+    background: rgba(16, 185, 129, 0.3);
+  }
+
+  .flow-content {
+    padding-bottom: 20px;
+  }
+
+  .flow-node {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.8rem;
+    font-weight: 600;
+    color: #e2e8f0;
+    margin-bottom: 2px;
+  }
+
+  .flow-detail {
+    font-size: 0.75rem;
+    color: #64748b;
+    line-height: 1.5;
+  }
+
+  .flow-detail code {
+    font-family: 'JetBrains Mono', monospace;
+    font-size: 0.7rem;
+    background: rgba(100, 116, 139, 0.15);
+    padding: 1px 5px;
+    border-radius: 3px;
+    color: #94a3b8;
+  }
+
+  /* Responsive */
+  @media (max-width: 768px) {
+    .modules-row { flex-direction: column; align-items: center; }
+    .module { max-width: 100%; min-width: 0; width: 100%; }
+    .layer { padding: 20px 16px; }
+    h1 { font-size: 1.5rem; }
+  }
+</style>
+</head>
+<body>
+<div class="container">
+
+  <h1>Smart LBSS 系统架构</h1>
+  <p class="subtitle">智能锂离子电池储能管理系统 — 三层 IoT 架构</p>
+
+  <!-- Cloud Layer -->
+  <div class="layer layer-cloud" style="margin-bottom: 0;">
+    <span class="layer-label">CLOUD LAYER</span>
+    <div class="layer-title">云端层</div>
+    <div class="modules-row">
+      <div class="module">
+        <div class="module-icon">&#x1f5a7;</div>
+        <div class="module-name">RCA</div>
+        <div class="module-device">Python / Flask — 服务器</div>
+        <div class="module-desc">远程控制应用，轮询 uGrid 状态，存储遥测数据至 MySQL，通过 MQTT 发布告警，提供 REST API 供客户端调用。</div>
+        <div class="module-tags">
+          <span class="tag">Flask :3000</span>
+          <span class="tag">MySQL</span>
+          <span class="tag">MQTT</span>
+          <span class="tag">CoAP Client</span>
+        </div>
+      </div>
+      <div class="module">
+        <div class="module-icon">&#x1f4bb;</div>
+        <div class="module-name">CA</div>
+        <div class="module-device">Python / curses — 终端</div>
+        <div class="module-desc">客户端 TUI 仪表盘，实时显示电池状态、告警信息，支持手动控制（全放电、目标 SoC、MPC 调参）。</div>
+        <div class="module-tags">
+          <span class="tag">Curses TUI</span>
+          <span class="tag">HTTP Client</span>
+          <span class="tag">MQTT Sub</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Connector: Cloud <-> Agg -->
+  <div class="connector">
+    <div class="connector-line"></div>
+    <div class="connector-label">
+      <span class="arrow-down">&#x25BC;</span>
+      <span class="proto">CoAP</span> GET /dev/state &nbsp;|&nbsp;
+      <span class="proto">HTTP</span> REST API &nbsp;|&nbsp;
+      <span class="proto">MQTT</span> ugrid/alerts/#
+      <span class="arrow-down">&#x25B2;</span>
+    </div>
+  </div>
+
+  <!-- Aggregation Layer -->
+  <div class="layer layer-agg">
+    <span class="layer-label">AGGREGATION LAYER</span>
+    <div class="layer-title">聚合层</div>
+    <div class="modules-row">
+      <div class="module">
+        <div class="module-icon">&#x1f50c;</div>
+        <div class="module-name">uGridController</div>
+        <div class="module-device">nRF52840 — Contiki-NG</div>
+        <div class="module-desc">微电网中央控制器，管理多个电池，运行 ML 预测模型和 MPC 优化算法，每 5 秒下发充放电功率指令。</div>
+        <div class="module-tags">
+          <span class="tag">ML 推理 60→16→8→2</span>
+          <span class="tag">MPC 梯度下降</span>
+          <span class="tag">CoAP Server</span>
+        </div>
+      </div>
+      <div class="module">
+        <div class="module-icon">&#x1f4e1;</div>
+        <div class="module-name">RPL Border Router</div>
+        <div class="module-device">nRF52840 — Contiki-NG</div>
+        <div class="module-desc">边界路由器，将 6LoWPAN 低功耗无线传感器网络桥接到 IPv6 互联网，提供 RPL 路由和可选 Web 界面。</div>
+        <div class="module-tags">
+          <span class="tag">6LoWPAN</span>
+          <span class="tag">RPL</span>
+          <span class="tag">SLIP Tunnel</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Connector: Agg <-> Edge -->
+  <div class="connector">
+    <div class="connector-line"></div>
+    <div class="connector-label">
+      <span class="arrow-down">&#x25BC;</span>
+      <span class="proto">CoAP</span> Observe /dev/state &nbsp;|&nbsp;
+      <span class="proto">CoAP</span> PUT /dev/power (milliwatts)
+      <span class="arrow-down">&#x25B2;</span>
+    </div>
+  </div>
+
+  <!-- Edge Layer -->
+  <div class="layer layer-edge">
+    <span class="layer-label">EDGE LAYER</span>
+    <div class="layer-title">边缘层</div>
+    <div class="modules-row">
+      <div class="module">
+        <div class="module-icon">&#x1f50b;</div>
+        <div class="module-name">BatteryController</div>
+        <div class="module-device">nRF52840 — Contiki-NG</div>
+        <div class="module-desc">单电池控制器，运行嵌入式 ML 模型估算 SoH，执行安全检查（过温/低 SoH 自动隔离），通过 CoAP 上报状态并接收功率指令。</div>
+        <div class="module-tags">
+          <span class="tag">ML 推理 40→16→8→1</span>
+          <span class="tag">CoAP Server</span>
+          <span class="tag">安全隔离</span>
+        </div>
+      </div>
+      <div class="module">
+        <div class="module-icon">&#x26a1;</div>
+        <div class="module-name">Battery Pack</div>
+        <div class="module-device">13.5kWh / 200Ah / 3.7V</div>
+        <div class="module-desc">锂离子电池组物理模型，模拟电压、电流、温度、SoC 的实时变化，包含内阻、转换效率、热模型和衰减模型。</div>
+        <div class="module-tags">
+          <span class="tag">物理仿真</span>
+          <span class="tag">热模型</span>
+          <span class="tag">SoH 衰减</span>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <!-- Data Flow -->
+  <div class="flow-section">
+    <div class="flow-title">数据流链路</div>
+    <div class="flow-steps">
+      <div class="flow-step">
+        <div class="flow-step-line">
+          <div class="flow-dot"></div>
+          <div class="flow-vert"></div>
+        </div>
+        <div class="flow-content">
+          <div class="flow-node">Battery Pack → BatteryController</div>
+          <div class="flow-detail">传感器数据（电压、电流、温度）每秒采样，SoC 通过库仑计数更新</div>
+        </div>
+      </div>
+      <div class="flow-step">
+        <div class="flow-step-line">
+          <div class="flow-dot"></div>
+          <div class="flow-vert"></div>
+        </div>
+        <div class="flow-content">
+          <div class="flow-node">BatteryController 内部处理</div>
+          <div class="flow-detail">运行 <code>battery_soh_regress</code> ML 模型（~3.1KB），结合物理模型计算 SoH，执行安全检查</div>
+        </div>
+      </div>
+      <div class="flow-step">
+        <div class="flow-step-line">
+          <div class="flow-dot"></div>
+          <div class="flow-vert"></div>
+        </div>
+        <div class="flow-content">
+          <div class="flow-node">BatteryController → uGridController</div>
+          <div class="flow-detail">通过 <code>CoAP Observe</code> 订阅 <code>/dev/state</code>，JSON 格式推送 V/I/T/SoC/SoH/State</div>
+        </div>
+      </div>
+      <div class="flow-step">
+        <div class="flow-step-line">
+          <div class="flow-dot"></div>
+          <div class="flow-vert"></div>
+        </div>
+        <div class="flow-content">
+          <div class="flow-node">uGridController 内部处理</div>
+          <div class="flow-detail">运行 <code>power_predictor_regress</code> 预测 PV/负载，MPC 投影梯度下降（100 次迭代）计算最优功率分配</div>
+        </div>
+      </div>
+      <div class="flow-step">
+        <div class="flow-step-line">
+          <div class="flow-dot"></div>
+          <div class="flow-vert"></div>
+        </div>
+        <div class="flow-content">
+          <div class="flow-node">uGridController → BatteryController</div>
+          <div class="flow-detail">每 5 秒 <code>CoAP PUT /dev/power</code> 下发 <code>{"u": 毫瓦}</code> 功率指令，控制充放电</div>
+        </div>
+      </div>
+      <div class="flow-step">
+        <div class="flow-step-line">
+          <div class="flow-dot"></div>
+          <div class="flow-vert"></div>
+        </div>
+        <div class="flow-content">
+          <div class="flow-node">uGridController → RCA</div>
+          <div class="flow-detail">经 RPL Border Router 桥接，RCA 每 5 秒 <code>CoAP GET /dev/state</code>（CBOR 编码）获取全量状态</div>
+        </div>
+      </div>
+      <div class="flow-step">
+        <div class="flow-step-line">
+          <div class="flow-dot"></div>
+          <div class="flow-vert"></div>
+        </div>
+        <div class="flow-content">
+          <div class="flow-node">RCA → MySQL + MQTT + CA</div>
+          <div class="flow-detail">遥测数据持久化至 MySQL，告警发布到 <code>ugrid/alerts/#</code>，REST API 供 CA 查询状态和下发控制指令</div>
+        </div>
+      </div>
+      <div class="flow-step">
+        <div class="flow-step-line">
+          <div class="flow-dot"></div>
+        </div>
+        <div class="flow-content">
+          <div class="flow-node">CA 用户操作 → RCA → uGridController → BatteryController</div>
+          <div class="flow-detail">用户通过 TUI 发送目标 SoC/放电/调参指令，经 REST API → RCA → <code>CoAP PUT /ctrl/obj</code> → 功率指令下发</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+</div>
+</body>
+</html>
