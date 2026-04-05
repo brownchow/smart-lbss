@@ -70,7 +70,7 @@
 
 /* 生成指定幅度的随机噪声，用于模拟传感器波动 */
 float get_random_noise(float magnitude) {
-    return ((random_rand() % 100) / 50.0f - 1.0f) * magnitude;
+    return ((random_rand() % 100) / 50.0f - 1.0f) * magnitude;  /* <- lib/random.h */
 }
 
 
@@ -139,8 +139,8 @@ struct ctimer ct_led_blink;                       /* 回调定时器（LED 闪�
  * ======================================================================== */
 void led_blink(void * pt) {
     if (current_state == STATE_INIT) {
-        leds_toggle(LEDS_YELLOW);
-        ctimer_reset(&ct_led_blink);
+        leds_toggle(LEDS_YELLOW);          /* <- dev/leds.h */
+        ctimer_reset(&ct_led_blink);       /* <- sys/ctimer.h (via contiki.h) */
     } else if (current_state == STATE_ISOLATED) {
         leds_toggle(LEDS_RED);
         ctimer_reset(&ct_led_blink);
@@ -150,14 +150,14 @@ void led_blink(void * pt) {
 
 /* 根据功率指令更新 LED 状态 */
 void update_leds() {
-    leds_off(~0);
+    leds_off(~0);                          /* <- dev/leds.h */
     if (current_state == STATE_RUNNING ) {
         if (power_setpoint > 0.5f) {
-            leds_on(LEDS_GREEN);  /* 充电 */
+            leds_on(LEDS_GREEN);           /* <- dev/leds.h */
         } else if (power_setpoint < -0.5f) {
-            leds_on(LEDS_RED);    /* 放电 */
+            leds_on(LEDS_RED);             /* <- dev/leds.h */
         } else {
-            leds_on(LEDS_BLUE);   /* 空闲 */
+            leds_on(LEDS_BLUE);            /* <- dev/leds.h */
         }
     }
 }
@@ -377,7 +377,7 @@ static void update_sensors_and_buffer() {
  * ======================================================================== */
 static void check_safety() {
 
-    battery_soh_regress(ml_buffer, ML_WINDOW*N_FEATURES, output, 1);
+    battery_soh_regress(ml_buffer, ML_WINDOW*N_FEATURES, output, 1);  /* <- includes/battery_soh_model.h (emlearn) */
 
     // clamp output to acceptable values
     output[0] = output[0] < 0 ? 0 : output[0];
@@ -423,33 +423,33 @@ static void check_safety() {
     bool warning_cycles = (charge_cycles > cycles_warning);
     
     if(critical_soh || critical_temp) {
-        LOG_INFO_("CRITICAL ✗\n");
-        LOG_ERR("!!! SAFETY CRITICAL !!! Isolating battery\n");
-        LOG_ERR("    Reason: ");
+        LOG_INFO_("CRITICAL ✗\n");          /* <- sys/log.h */
+        LOG_ERR("!!! SAFETY CRITICAL !!! Isolating battery\n");  /* <- sys/log.h */
+        LOG_ERR("    Reason: ");            /* <- sys/log.h */
         if(critical_soh) {
-          LOG_ERR_("SoH=%ld.%01ld%% (min 75%%) ",
+          LOG_ERR_("SoH=%ld.%01ld%% (min 75%%) ",  /* <- sys/log.h */
                    (long)soh_pct_int, (long)soh_pct_dec);
         }
         if(critical_temp) {
-          LOG_ERR_("Temp=%ld.%01ld°C (max 60°C)", (long)t_int, (long)t_dec);
+          LOG_ERR_("Temp=%ld.%01ld°C (max 60°C)", (long)t_int, (long)t_dec);  /* <- sys/log.h */
         }
-        LOG_ERR_("\n");
-        LOG_ERR("Press button to reset battery to factory conditions\n");
+        LOG_ERR_("\n");                     /* <- sys/log.h */
+        LOG_ERR("Press button to reset battery to factory conditions\n");  /* <- sys/log.h */
         
         current_state = STATE_ISOLATED;
         power_setpoint = 0.0f;
         bat_current = 0.0f;
-        coap_notify_observers(&res_dev_state);
+        coap_notify_observers(&res_dev_state);  /* <- coap-engine.h */
         
-        ctimer_reset(&ct_led_blink);
+        ctimer_reset(&ct_led_blink);        /* <- sys/ctimer.h */
 
-        leds_off(LEDS_ALL);
-        leds_toggle(LEDS_RED);
+        leds_off(LEDS_ALL);                 /* <- dev/leds.h */
+        leds_toggle(LEDS_RED);              /* <- dev/leds.h */
         
     } else if (warning_soh || warning_temp || warning_cycles) {
-        LOG_INFO_("WARNING ⚠\n");
+        LOG_INFO_("WARNING ⚠\n");           /* <- sys/log.h */
         if(warning_soh) {
-            LOG_WARN("Battery degradation: SoH=%ld.%01ld%% (%ld.%03ld Ah remaining)\n", 
+            LOG_WARN("Battery degradation: SoH=%ld.%01ld%% (%ld.%03ld Ah remaining)\n",  /* <- sys/log.h */
                      (long)soh_pct_int, (long)soh_pct_dec,
                      (long)cap_int, (long)cap_dec3);
         }
@@ -457,16 +457,16 @@ static void check_safety() {
             int32_t peak_deci = (int32_t)(peak_temp_reached * 10.0f);
             int32_t peak_int = peak_deci / 10;
             int32_t peak_dec = (peak_deci >= 0 ? peak_deci : -peak_deci) % 10;
-            LOG_WARN("High temperature: %ld.%01ld°C (peak: %ld.%01ld°C)\n", 
+            LOG_WARN("High temperature: %ld.%01ld°C (peak: %ld.%01ld°C)\n",  /* <- sys/log.h */
                      (long)t_int, (long)t_dec,
                      (long)peak_int, (long)peak_dec);
         }
         if(warning_cycles) {
-            LOG_WARN("High cycle count: %lu cycles completed\n", 
+            LOG_WARN("High cycle count: %lu cycles completed\n",  /* <- sys/log.h */
                      (unsigned long)charge_cycles);
         }
     } else {
-        LOG_INFO("OK\n");
+        LOG_INFO("OK\n");                   /* <- sys/log.h */
     }
 }
 
@@ -516,12 +516,12 @@ PROCESS_THREAD(battery_controller, ev, data) {
     
 
     /* 避免 emlearn 符号被链接器优化掉 */
-    printf("%p\n", eml_error_str);
-    printf("%p\n", eml_net_activation_function_strs);
+    printf("%p\n", eml_error_str);                      /* <- stdio.h + includes/battery_soh_model.h */
+    printf("%p\n", eml_net_activation_function_strs);   /* <- stdio.h + includes/battery_soh_model.h */
     
 
     /* 启动 LED 闪烁定时器（1 秒周期） */
-    ctimer_set(
+    ctimer_set(                                         /* <- sys/ctimer.h */
             &ct_led_blink,
             CLOCK_SECOND,
             led_blink,
@@ -530,9 +530,9 @@ PROCESS_THREAD(battery_controller, ev, data) {
     /* 注册 CoAP 资源：
      *   GET  /dev/state  → 返回电池状态（支持 OBSERVE 订阅）
      *   PUT  /dev/power  → 接收 uGridController 下发的功率指令 */
-    coap_activate_resource(&res_dev_state, "dev/state");
-    coap_activate_resource(&res_dev_power, "dev/power");
-    LOG_INFO("[INIT] CoAP resources activated (dev/state is OBSERVABLE)\n");
+    coap_activate_resource(&res_dev_state, "dev/state");  /* <- coap-engine.h */
+    coap_activate_resource(&res_dev_power, "dev/power");  /* <- coap-engine.h */
+    LOG_INFO("[INIT] CoAP resources activated (dev/state is OBSERVABLE)\n");  /* <- sys/log.h */
 
     /* ====================================================================
      * 阶段一：向 uGridController 注册（循环重试直到成功）
@@ -546,22 +546,22 @@ PROCESS_THREAD(battery_controller, ev, data) {
         LOG_INFO("[INIT] Registration attempt #%d\n", retry_count++);
         
         if (retry_count > 0) {
-            etimer_set(&et_init_wait, CLOCK_SECOND * 1);
-            PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et_init_wait));
+            etimer_set(&et_init_wait, CLOCK_SECOND * 1);            /* <- sys/etimer.h */
+            PROCESS_WAIT_EVENT_UNTIL(etimer_expired(&et_init_wait)); /* <- contiki.h */
         }
         update_leds();
     
         /* 构建 CoAP POST 请求：POST /dev/register，payload = battery_id */
-        coap_endpoint_parse(UGRID_EP, strlen(UGRID_EP), &server_ep);
-        memset(request, 0, sizeof(coap_message_t));
-        coap_init_message(request, COAP_TYPE_CON, COAP_POST, 0);
-        coap_set_header_uri_path(request, "dev/register");
+        coap_endpoint_parse(UGRID_EP, strlen(UGRID_EP), &server_ep);  /* <- coap-engine.h */
+        memset(request, 0, sizeof(coap_message_t));                     /* <- string.h */
+        coap_init_message(request, COAP_TYPE_CON, COAP_POST, 0);        /* <- coap-engine.h */
+        coap_set_header_uri_path(request, "dev/register");              /* <- coap-engine.h */
         static char payload[64];
-        snprintf(payload, sizeof(payload), "%d", battery_id);
-        coap_set_payload(request, (uint8_t*)payload, strlen(payload));
+        snprintf(payload, sizeof(payload), "%d", battery_id);           /* <- stdio.h */
+        coap_set_payload(request, (uint8_t*)payload, strlen(payload));  /* <- coap-engine.h */
 
         /* 发送请求（阻塞等待响应，回调函数 reg_callback 处理结果） */
-        COAP_BLOCKING_REQUEST(&server_ep, request, reg_callback);
+        COAP_BLOCKING_REQUEST(&server_ep, request, reg_callback);       /* <- coap-blocking-api.h */
         
         if(current_state == STATE_RUNNING) {
             LOG_INFO("[INIT] Entering main control loop\n");
@@ -572,10 +572,10 @@ PROCESS_THREAD(battery_controller, ev, data) {
     /* ====================================================================
      * 阶段二：主控制循环（每 5 秒执行一次）
      * ==================================================================== */
-    etimer_set(&et_loop, CLOCK_SECOND * 5);
+    etimer_set(&et_loop, CLOCK_SECOND * 5);  /* <- sys/etimer.h */
     
     while(1) {
-        PROCESS_WAIT_EVENT();
+        PROCESS_WAIT_EVENT();  /* <- contiki.h */
         
         /* 定时器事件：执行传感器更新 + 安全检查 + 状态通知 */
         if(ev == PROCESS_EVENT_TIMER && data == &et_loop) {
@@ -594,14 +594,14 @@ PROCESS_THREAD(battery_controller, ev, data) {
             }
             
             /* 通过 CoAP OBSERVE 机制推送状态给所有订阅者（uGridController） */
-            coap_notify_observers(&res_dev_state);
+            coap_notify_observers(&res_dev_state);  /* <- coap-engine.h */
 
-            etimer_reset(&et_loop);
+            etimer_reset(&et_loop);  /* <- sys/etimer.h */
         }
         
         
         /* 按钮事件：仅在 ISOLATED 状态下有效，触发恢复出厂状态 */
-        if(ev == button_hal_release_event && current_state == STATE_ISOLATED) {
+        if(ev == button_hal_release_event && current_state == STATE_ISOLATED) {  /* <- dev/button-hal.h */
             LOG_INFO("[INFO] Factory Reset Triggered\n");
 
             current_state = STATE_RUNNING; 
