@@ -1,3 +1,41 @@
+/**
+ * ============================================================================
+ * BatteryController — 电池控制器（边缘层）
+ * ============================================================================
+ *
+ * 【架构定位】
+ *   本文件是 Contiki-NG 操作系统的一个应用程序，运行在边缘层（Edge Layer），
+ *   目标硬件为 nRF52840 等低功耗 MCU。它不是一个独立的 Linux 程序，
+ *   必须依赖 Contiki-NG 的运行时环境才能工作。
+ *
+ * 【为什么不能脱离 Contiki-NG 运行？】
+ *   本文件依赖以下 Contiki-NG 专属组件：
+ *     - PROCESS_THREAD / AUTOSTART_PROCESSES — Contiki 的协程调度模型
+ *     - coap-engine / coap-blocking-api   — Contiki 内置的 CoAP 协议栈
+ *     - etimer / ctimer                   — Contiki 的事件/回调定时器
+ *     - uip / uip-ds6                    — Contiki 的 IPv6 协议栈
+ *     - dev/leds / dev/button-hal         — Contiki 的硬件抽象层
+ *   编译产物本质上是 Contiki-NG 的"插件"，必须由 contiki_main() 启动并调度。
+ *
+ * 【核心功能模块】
+ *   1. 电池物理仿真  — 根据功率指令动态计算 V/I/T/SoC 变化（update_sensors_and_buffer）
+ *   2. SoH 衰减模型  — 综合循环/温度/应力/C-rate 等多因素计算容量衰减
+ *   3. ML 推理       — 调用 emlearn 导出的 C 头文件模型估算 SoH（check_safety）
+ *   4. 安全检查      — 超阈值时自动隔离电池，按钮触发恢复出厂状态
+ *   5. CoAP 通信     — 向 uGridController 注册、上报状态（OBSERVABLE）、接收功率指令
+ *
+ * 【主循环流程（每 5 秒）】
+ *   更新传感器 → 运行 ML 估算 SoH → 安全检查 → 通知 uGridController → 等待下一周期
+ *
+ * 【分层架构说明】
+ *   边缘层（本文件）vs 聚合层（uGridController）的区别：
+ *     - 边缘层：管理单个电池，毫秒级安全决策，KB 级内存，叶子节点
+ *     - 聚合层：管理多个电池 + 逆变器，秒级全局优化，MB/GB 级内存，网关节点
+ *   类比：BatteryController = 汽车 ABS 系统（独立快速反应）
+ *         uGridController  = 交通调度中心（全局协调）
+ * ============================================================================
+ */
+
 #include "contiki.h"
 #include "coap-engine.h"
 #include "coap-blocking-api.h"
@@ -26,63 +64,79 @@
 #define LOG_MODULE "BatCtrl"
 #define LOG_LEVEL LOG_LEVEL_INFO
 
-// utility functions
+/* ========================================================================
+ * 工具函数
+ * ======================================================================== */
+
+/* 生成指定幅度的随机噪声，用于模拟传感器波动 */
 float get_random_noise(float magnitude) {
     return ((random_rand() % 100) / 50.0f - 1.0f) * magnitude;
 }
 
 
-// scaling configuration and current battery state
-#define POWER_SCALE_FACTOR 1000.0f  /* Scale factor: 1kW per unit power */
-#define SCALED_CAPACITY_AH 200.0f   /* Scaled capacity: 200Ah (100x cells in parallel) */
+/* ========================================================================
+ * 全局状态变量
+ * ======================================================================== */
+
+/* 缩放配置（模拟 100 节电芯并联的家用 13.5kWh 电池包） */
+#define POWER_SCALE_FACTOR 1000.0f  /* 功率缩放因子：每单位 1kW */
+#define SCALED_CAPACITY_AH 200.0f   /* 缩放容量：200Ah */
+
+/* 电池当前状态机：INIT → RUNNING / ISOLATED */
 battery_state_t current_state = STATE_INIT;
+
+/* 电池实时物理参数 */
 float bat_voltage = 3.7f;
 float bat_current = 0.0f;
 float bat_temp = 25.0f;
 float bat_soc = 0.8f;
 float bat_soh = 1.0f;
-float bat_capacity_ah = SCALED_CAPACITY_AH;  /* Scaled: 200Ah */
-float power_setpoint = 0.0f;   /* Power in Watts (will be scaled) */
-int battery_id = 1;            /* Application level device ID */
+float bat_capacity_ah = SCALED_CAPACITY_AH;
+float power_setpoint = 0.0f;   /* uGridController 下发的功率指令（W） */
+int battery_id = 1;            /* 应用层设备 ID */
 
-// safety configuration
-float soh_critical = 0.65f;      /* sotto questo → CRITICAL  */
-float soh_warning  = 0.75f;      /* sotto questo → WARNING   */
-float temp_critical = 60.0f;     /* sopra questo → CRITICAL  */
-float temp_warning  = 50.0f;     /* sopra questo → WARNING   */
-uint32_t cycles_warning = 100;   /* oltre questo → WARNING   */
+/* ========================================================================
+ * 安全阈值配置
+ * ======================================================================== */
+float soh_critical = 0.65f;      /* 低于此值 → CRITICAL，立即隔离 */
+float soh_warning  = 0.75f;      /* 低于此值 → WARNING 告警 */
+float temp_critical = 60.0f;     /* 高于此值 → CRITICAL，立即隔离 */
+float temp_warning  = 50.0f;     /* 高于此值 → WARNING 告警 */
+uint32_t cycles_warning = 100;   /* 超过此循环次数 → WARNING 告警 */
 
-// ML configuration
-float ml_buffer[ML_WINDOW * N_FEATURES];
-float output[1];
+/* ========================================================================
+ * ML 推理缓冲区
+ * ======================================================================== */
+float ml_buffer[ML_WINDOW * N_FEATURES];  /* 滑动窗口传感器数据 */
+float output[1];                           /* ML 模型输出（SoH 估算值） */
 
-// realistic battery modeling
-uint32_t charge_cycles = 0;       /* Numero di cicli carica/scarica */
-float total_ah_throughput = 0.0f; /* Ah totali trasferiti */
-float peak_temp_reached = 25.0f;  /* Temperatura massima raggiunta */
-uint8_t was_charging = false;        /* Per contare cicli */
+/* ========================================================================
+ * 电池老化追踪变量
+ * ======================================================================== */
+uint32_t charge_cycles = 0;       /* 充放电循环次数 */
+float total_ah_throughput = 0.0f; /* 累计 Ah 吞吐量 */
+float peak_temp_reached = 25.0f;  /* 历史最高温度 */
+uint8_t was_charging = false;     /* 上一次是否处于充电状态（用于计数循环） */
 
-// coap resource declaration
+/* ========================================================================
+ * CoAP 资源声明（在 resources/ 目录下定义）
+ * ======================================================================== */
 extern coap_resource_t
-    res_dev_state, 
-    res_dev_power;
+    res_dev_state,    /* GET + OBSERVE: 返回电池状态 */
+    res_dev_power;    /* PUT: 接收 uGridController 的功率指令 */
 
-// timer definition
-struct etimer et_loop, et_init_wait, et_notify;
-struct ctimer ct_led_blink;
+/* ========================================================================
+ * 定时器定义
+ * ======================================================================== */
+struct etimer et_loop, et_init_wait, et_notify;  /* 事件定时器 */
+struct ctimer ct_led_blink;                       /* 回调定时器（LED 闪烁） */
 
-// utility functions
-static void print_battery_status(void) {
-    int v = (int)lroundf(bat_voltage*100.0f);
-
-    LOG_INFO("V:%d.%d, I:%d.%d, T:%d.%d, SoC: %d.%d, SoH: %d.%d\n",
-           v/100, abs(v)%100,
-           (int)(bat_current) / 100,(int)(bat_current) % 100,
-           (int)(bat_temp) / 100,(int)(bat_temp) % 100,
-           (int)(bat_soc*100.0f) / 100,(int)(bat_soc*100.0f) % 100,
-           (int)(bat_soh*100.0f) / 100,(int)(bat_soh*100.0f) % 100);
-}
-
+/* ========================================================================
+ * LED 状态指示
+ *   INIT 状态：黄色闪烁
+ *   ISOLATED 状态：红色闪烁
+ *   RUNNING 状态：绿色=充电，红色=放电，蓝色=空闲
+ * ======================================================================== */
 void led_blink(void * pt) {
     if (current_state == STATE_INIT) {
         leds_toggle(LEDS_YELLOW);
@@ -94,19 +148,45 @@ void led_blink(void * pt) {
 }
 
 
+/* 根据功率指令更新 LED 状态 */
 void update_leds() {
     leds_off(~0);
     if (current_state == STATE_RUNNING ) {
         if (power_setpoint > 0.5f) {
-            leds_on(LEDS_GREEN);  /* Charging */
+            leds_on(LEDS_GREEN);  /* 充电 */
         } else if (power_setpoint < -0.5f) {
-            leds_on(LEDS_RED);    /* Discharging */
+            leds_on(LEDS_RED);    /* 放电 */
         } else {
-            leds_on(LEDS_BLUE);   /* Idle */
+            leds_on(LEDS_BLUE);   /* 空闲 */
         }
     }
 }
 
+/* 打印电池状态到日志 */
+static void print_battery_status(void) {
+    int v = (int)lroundf(bat_voltage*100.0f);
+
+    LOG_INFO("V:%d.%d, I:%d.%d, T:%d.%d, SoC: %d.%d, SoH: %d.%d\n",
+           v/100, abs(v)%100,
+           (int)(bat_current) / 100,(int)(bat_current) % 100,
+           (int)(bat_temp) / 100,(int)(bat_temp) % 100,
+           (int)(bat_soc*100.0f) / 100,(int)(bat_soc*100.0f) % 100,
+           (int)(bat_soh*100.0f) / 100,(int)(bat_soh*100.0f) % 100);
+}
+
+/* ========================================================================
+ * 电池物理仿真 + ML 特征缓冲区更新
+ *
+ * 这是本文件最核心的函数，模拟了一个真实 Li-ion 电池包的物理行为：
+ *   步骤 0：根据 SoC 限制功率（防过充/过放降额）
+ *   步骤 1：从功率指令计算电流（含噪声）
+ *   步骤 2：更新电压（OCV + 内阻压降 + SoC 边缘修正）
+ *   步骤 3：更新 SoC（考虑充放电效率）
+ *   步骤 4：更新温度（I²R 发热 - 散热）
+ *   步骤 5：更新 SoH（多因素衰减模型）
+ *
+ * 最后将 V/I/T/SoC 归一化后填入 ML 滑动窗口缓冲区
+ * ======================================================================== */
 static void update_sensors_and_buffer() {
     if (current_state == STATE_RUNNING) {
         /* Parametri fisici della batteria Li-ion SCALATA (Pacco Domestico 13.5kWh) */
@@ -283,6 +363,18 @@ static void update_sensors_and_buffer() {
     ml_buffer[idx+3] = bat_soc;
 }
 
+/* ========================================================================
+ * 安全检查 + ML SoH 推理
+ *
+ * 1. 调用 emlearn 模型（ML 推理，C 头文件中内联实现）
+ * 2. ML 输出 + 物理模型 SoH 加权融合（70% ML + 30% 物理）
+ * 3. 温度/SoC 应力修正
+ * 4. 三级安全检查：
+ *    - CRITICAL（SoH < 65% 或 T > 60°C）→ 立即隔离电池
+ *    - WARNING（SoH < 75% 或 T > 50°C 或循环 > 100）→ 日志告警
+ *    - OK → 正常运行
+ * 5. 隔离后只能通过物理按钮恢复出厂状态
+ * ======================================================================== */
 static void check_safety() {
 
     battery_soh_regress(ml_buffer, ML_WINDOW*N_FEATURES, output, 1);
@@ -378,7 +470,7 @@ static void check_safety() {
     }
 }
 
-// registration callback
+/* CoAP 注册回调：收到 uGridController 的 ACK 后进入 RUNNING 状态 */
 static void reg_callback(coap_message_t *response) {
 
     if(response) {
@@ -396,6 +488,22 @@ static void reg_callback(coap_message_t *response) {
     }
 }
 
+/* ========================================================================
+ * Contiki-NG 进程定义
+ *
+ * PROCESS() + AUTOSTART_PROCESSES() 是 Contiki 的宏，等价于声明一个
+ * 协程入口函数。这个进程会在 Contiki 事件循环中被调度执行。
+ *
+ * 生命周期：
+ *   1. 初始化：启动 LED 定时器 → 注册 CoAP 资源
+ *   2. 注册阶段：向 uGridController 发送 POST /dev/register（循环重试直到成功）
+ *   3. 主循环（每 5 秒）：
+ *      - 更新传感器数据 + ML 特征缓冲区
+ *      - 运行安全检查（ML SoH 推理 + 阈值判断）
+ *      - 每 50 秒打印一次状态日志
+ *      - 通过 CoAP OBSERVE 通知 uGridController
+ *   4. 隔离恢复：按钮事件触发恢复出厂状态
+ * ======================================================================== */
 PROCESS(battery_controller, "Battery Controller");
 AUTOSTART_PROCESSES(&battery_controller);
 
@@ -407,29 +515,32 @@ PROCESS_THREAD(battery_controller, ev, data) {
     PROCESS_BEGIN();
     
 
-    // avoid errors with emlearn
+    /* 避免 emlearn 符号被链接器优化掉 */
     printf("%p\n", eml_error_str);
     printf("%p\n", eml_net_activation_function_strs);
     
 
-    // start timer
+    /* 启动 LED 闪烁定时器（1 秒周期） */
     ctimer_set(
             &ct_led_blink,
             CLOCK_SECOND,
             led_blink,
             NULL);
 
-    // activate coap resources
+    /* 注册 CoAP 资源：
+     *   GET  /dev/state  → 返回电池状态（支持 OBSERVE 订阅）
+     *   PUT  /dev/power  → 接收 uGridController 下发的功率指令 */
     coap_activate_resource(&res_dev_state, "dev/state");
     coap_activate_resource(&res_dev_power, "dev/power");
     LOG_INFO("[INIT] CoAP resources activated (dev/state is OBSERVABLE)\n");
 
-    // registate to CoAP endpoint
+    /* ====================================================================
+     * 阶段一：向 uGridController 注册（循环重试直到成功）
+     * ==================================================================== */
     LOG_INFO("[INIT] Starting registration to µGrid controller...\n");
     LOG_INFO("[INIT] Target endpoint: %s\n", UGRID_EP);
     
 
-    // registration phase 
     while(current_state == STATE_INIT) {
 
         LOG_INFO("[INIT] Registration attempt #%d\n", retry_count++);
@@ -440,7 +551,7 @@ PROCESS_THREAD(battery_controller, ev, data) {
         }
         update_leds();
     
-        // build request
+        /* 构建 CoAP POST 请求：POST /dev/register，payload = battery_id */
         coap_endpoint_parse(UGRID_EP, strlen(UGRID_EP), &server_ep);
         memset(request, 0, sizeof(coap_message_t));
         coap_init_message(request, COAP_TYPE_CON, COAP_POST, 0);
@@ -449,7 +560,7 @@ PROCESS_THREAD(battery_controller, ev, data) {
         snprintf(payload, sizeof(payload), "%d", battery_id);
         coap_set_payload(request, (uint8_t*)payload, strlen(payload));
 
-        // send request
+        /* 发送请求（阻塞等待响应，回调函数 reg_callback 处理结果） */
         COAP_BLOCKING_REQUEST(&server_ep, request, reg_callback);
         
         if(current_state == STATE_RUNNING) {
@@ -458,12 +569,15 @@ PROCESS_THREAD(battery_controller, ev, data) {
         }
     }
 
-    // notify state 
+    /* ====================================================================
+     * 阶段二：主控制循环（每 5 秒执行一次）
+     * ==================================================================== */
     etimer_set(&et_loop, CLOCK_SECOND * 5);
     
     while(1) {
         PROCESS_WAIT_EVENT();
         
+        /* 定时器事件：执行传感器更新 + 安全检查 + 状态通知 */
         if(ev == PROCESS_EVENT_TIMER && data == &et_loop) {
             if(current_state != STATE_ISOLATED) {
                 update_sensors_and_buffer();
@@ -479,14 +593,14 @@ PROCESS_THREAD(battery_controller, ev, data) {
                 }
             }
             
-            // notify uGridController
+            /* 通过 CoAP OBSERVE 机制推送状态给所有订阅者（uGridController） */
             coap_notify_observers(&res_dev_state);
 
             etimer_reset(&et_loop);
         }
         
         
-        // can only be triggered when in isolated state
+        /* 按钮事件：仅在 ISOLATED 状态下有效，触发恢复出厂状态 */
         if(ev == button_hal_release_event && current_state == STATE_ISOLATED) {
             LOG_INFO("[INFO] Factory Reset Triggered\n");
 
