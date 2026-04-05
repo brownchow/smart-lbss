@@ -1,33 +1,23 @@
-/*
- * Copyright (c) 2017, RISE SICS
- * All rights reserved.
+/**
+ * ============================================================================
+ * webserver.c — 嵌入式 Web 服务器（用于调试 RPL 网络拓扑）
+ * ============================================================================
  *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions
- * are met:
- * 1. Redistributions of source code must retain the above copyright
- *    notice, this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright
- *    notice, this list of conditions and the following disclaimer in the
- *    documentation and/or other materials provided with the distribution.
- * 3. Neither the name of the Institute nor the names of its contributors
- *    may be used to endorse or promote products derived from this software
- *    without specific prior written permission.
+ * 【功能】提供一个轻量级 HTTP 服务，通过浏览器查看 RPL 网络的邻居、路由和拓扑信息
  *
- * THIS SOFTWARE IS PROVIDED BY THE INSTITUTE AND CONTRIBUTORS ``AS IS'' AND
- * ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE
- * ARE DISCLAIMED.  IN NO EVENT SHALL THE INSTITUTE OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS
- * OR SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION)
- * HOWEVER CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT
- * LIABILITY, OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY
- * OUT OF THE USE OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF
- * SUCH DAMAGE.
+ * 【访问方式】
+ *   浏览器访问 Border Router 的 IPv6 地址：http://[fd00::1]/
  *
- * This file is part of the Contiki operating system.
+ * 【页面内容】
+ *   1. Neighbors — 直连的 IPv6 邻居节点列表
+ *   2. Routes    — IPv6 路由表（目标网络/下一跳/剩余生存时间）
+ *   3. Routing links — RPL DAG 拓扑链接（子节点 → 父节点）
  *
+ * 【技术实现】
+ *   - 使用 Contiki 的 httpd-simple（单缓冲区静态 Web 服务器）
+ *   - 页面内容动态生成，通过 protothread 分段输出
+ *   - 使用静态缓冲区（256 字节），不支持多连接并发
+ * ============================================================================
  */
 
 #include "contiki.h"
@@ -52,13 +42,15 @@ static int blen;
   blen = 0; \
 } while(0);
 
-/* Use simple webserver with only one page for minimum footprint.
- * Multiple connections can result in interleaved tcp segments since
- * a single static buffer is used for all segments.
+/* 使用简单 Web 服务器以最小化内存占用。
+ * 多连接可能导致 TCP 分段交错，因为所有连接共享同一个静态缓冲区。
  */
 #include "httpd-simple.h"
 
 /*---------------------------------------------------------------------------*/
+/**
+ * 将 IPv6 地址格式化为字符串（支持 :: 缩写）
+ */
 static void
 ipaddr_add(const uip_ipaddr_t *addr)
 {
@@ -81,6 +73,12 @@ ipaddr_add(const uip_ipaddr_t *addr)
   }
 }
 /*---------------------------------------------------------------------------*/
+/**
+ * 动态生成路由拓扑 HTML 页面
+ *
+ * 使用 Contiki 的 PSOCK（protothread socket）分段输出，
+ * 避免大页面占用过多内存。每生成一段就 SEND 一次。
+ */
 static
 PT_THREAD(generate_routes(struct httpd_state *s))
 {
@@ -91,7 +89,7 @@ PT_THREAD(generate_routes(struct httpd_state *s))
 
   ADD("  Neighbors\n  <ul>\n");
   SEND(&s->sout);
-  for(nbr = uip_ds6_nbr_head();
+  for(nbr = uip_ds6_nbr_head();  /* <- net/ipv6/uip-ds6-nbr.h */
       nbr != NULL;
       nbr = uip_ds6_nbr_next(nbr)) {
     ADD("    <li>");
@@ -107,7 +105,7 @@ PT_THREAD(generate_routes(struct httpd_state *s))
     static uip_ds6_route_t *r;
     ADD("  Routes\n  <ul>\n");
     SEND(&s->sout);
-    for(r = uip_ds6_route_head(); r != NULL; r = uip_ds6_route_next(r)) {
+    for(r = uip_ds6_route_head(); r != NULL; r = uip_ds6_route_next(r)) {  /* <- net/ipv6/uip-ds6-route.h */
       ADD("    <li>");
       ipaddr_add(&r->ipaddr);
       ADD("/%u (via ", r->length);
@@ -126,12 +124,12 @@ PT_THREAD(generate_routes(struct httpd_state *s))
     static uip_sr_node_t *link;
     ADD("  Routing links\n  <ul>\n");
     SEND(&s->sout);
-    for(link = uip_sr_node_head(); link != NULL; link = uip_sr_node_next(link)) {
+    for(link = uip_sr_node_head(); link != NULL; link = uip_sr_node_next(link)) {  /* <- net/ipv6/uip-sr.h */
       if(link->parent != NULL) {
         uip_ipaddr_t child_ipaddr;
         uip_ipaddr_t parent_ipaddr;
 
-        NETSTACK_ROUTING.get_sr_node_ipaddr(&child_ipaddr, link);
+        NETSTACK_ROUTING.get_sr_node_ipaddr(&child_ipaddr, link);        /* <- net/routing/routing.h */
         NETSTACK_ROUTING.get_sr_node_ipaddr(&parent_ipaddr, link->parent);
 
         ADD("    <li>");
@@ -155,21 +153,30 @@ PT_THREAD(generate_routes(struct httpd_state *s))
   PSOCK_END(&s->sout);
 }
 /*---------------------------------------------------------------------------*/
+/**
+ * Web 服务器进程：监听 TCP 事件并分发给 httpd 处理
+ */
 PROCESS(webserver_nogui_process, "Web server");
 PROCESS_THREAD(webserver_nogui_process, ev, data)
 {
   PROCESS_BEGIN();
 
-  httpd_init();
+  httpd_init();  /* <- httpd-simple.h */
 
   while(1) {
-    PROCESS_WAIT_EVENT_UNTIL(ev == tcpip_event);
-    httpd_appcall(data);
+    PROCESS_WAIT_EVENT_UNTIL(ev == tcpip_event);  /* <- contiki.h */
+    httpd_appcall(data);                          /* <- httpd-simple.h */
   }
 
   PROCESS_END();
 }
 /*---------------------------------------------------------------------------*/
+/**
+ * 脚本路由函数：将所有请求指向 generate_routes
+ *
+ * 这是 httpd-simple 的回调入口，httpd 收到请求后会调用此函数
+ * 获取对应的页面生成器（protothread 函数指针）。
+ */
 httpd_simple_script_t
 httpd_simple_get_script(const char *name)
 {
