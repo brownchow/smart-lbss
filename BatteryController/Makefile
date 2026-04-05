@@ -12,5 +12,5 @@ TARGET_LIBFILES += -lm
 MODULES_REL += ../.venv/lib/python3.9/site-packages/emlearn
 INC += ../.venv/lib/python3.9/site-packages/emlearn
 
-CONTIKI = ../../..
+CONTIKI = /home/harrison/contiki-ng
 include $(CONTIKI)/Makefile.include

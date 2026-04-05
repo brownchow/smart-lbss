@@ -1,3 +1,8 @@
 .venv/
 .DS_STORE
 build/
+.pids/
+.logs/
+__pycache__/
+*.pyc
+*.log

@@ -23,7 +23,7 @@ import cbor2
 MYSQL_CONFIG = {
     "host": "localhost",
     "user": "root",
-    "password": "",
+    "password": "12345678",
     "port": 3306,
 }
 DB_NAME = "ugrid"
