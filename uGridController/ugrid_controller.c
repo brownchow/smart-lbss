@@ -1,3 +1,41 @@
+/**
+ * ============================================================================
+ * uGridController — 微电网控制器（聚合层）
+ * ============================================================================
+ *
+ * 【架构定位】
+ *   本文件是 Contiki-NG 操作系统的一个应用程序，运行在聚合层（Aggregation Layer），
+ *   作为多个 BatteryController 的"大脑"。它负责：
+ *     - 接收 BatteryController 的注册请求
+ *     - 订阅（OBSERVE）每个电池的状态变化
+ *     - 运行 ML 功率预测模型
+ *     - 运行 MPC（模型预测控制）优化充放电策略
+ *     - 向每个电池下发功率指令
+ *
+ * 【与 BatteryController 的区别】
+ *   边缘层（BatteryController）：管理单个电池，关注安全保护，毫秒级响应
+ *   聚合层（uGridController）：  管理多个电池，关注全局优化，秒级响应
+ *   类比：BatteryController = 汽车 ABS 系统
+ *         uGridController  = 交通调度中心
+ *
+ * 【核心功能模块】
+ *   1. 环境仿真（update_env）— 模拟 PV 发电、负载消耗、天气变化
+ *   2. ML 功率预测（run_mpc）— 调用 emlearn 模型预测未来 PV 和负载
+ *   3. MPC 优化（run_mpc）  — 投影梯度下降算法计算每块电池的最优功率
+ *   4. 电池管理          — 注册、订阅 OBSERVE、下发功率指令
+ *   5. CoAP 资源         — 注册、状态查询、MPC 参数调节、手动目标设定
+ *
+ * 【主循环流程（每 5 秒）】
+ *   更新环境仿真 → ML 功率预测 → MPC 优化 → 向各电池下发功率指令 → 打印状态
+ *
+ * 【CoAP 资源一览】
+ *   POST /dev/register  — 接收 BatteryController 注册
+ *   GET  /dev/state     — 返回微电网全局状态（CBOR 格式）
+ *   PUT  /ctrl/mpc      — 远程调节 MPC 参数（alpha/beta/gama/price）
+ *   GET/PUT /ctrl/obj   — 查看/设置单个电池的手动功率目标
+ * ============================================================================
+ */
+
 #include "contiki.h"
 #include "coap-engine.h"
 #include "coap-blocking-api.h"
@@ -23,51 +61,72 @@
 #define LOG_MODULE "uGrid"
 #define LOG_LEVEL LOG_LEVEL_INFO
 
-battery_node_t batteries[MAX_BATTERIES];
-int battery_count = 0;
+/* ========================================================================
+ * 电池节点管理
+ * ======================================================================== */
+battery_node_t batteries[MAX_BATTERIES];  /* 已注册电池数组 */
+int battery_count = 0;                     /* 当前已注册电池数量 */
 
-/* MPC Params – modificabili da remoto via /ctrl/mpc */
+/* ========================================================================
+ * MPC 优化参数（可通过 /ctrl/mpc 远程调节）
+ *   alpha — 电网电价权重
+ *   beta  — 电池衰减惩罚权重
+ *   gama  — SoC 偏离参考值的惩罚权重
+ *   price — 当前电价
+ * ======================================================================== */
 float alpha = 1.0f;
 float beta  = 1.0f;
 float gama  = 20.0f;
 float price = 0.25f;
 
-#define FREQ_COMPUTING  CLOCK_SECOND * 5
-#define K_FACT          0.05f
-#define SOC_REF         0.5f
-#define LEARNING_RATE   0.1f
-#define PGD_ITERATIONS  100
+/* ========================================================================
+ * MPC 算法常量
+ * ======================================================================== */
+#define FREQ_COMPUTING  CLOCK_SECOND * 5  /* 计算周期：5 秒 */
+#define K_FACT          0.05f             /* SoC 变化系数 */
+#define SOC_REF         0.5f              /* SoC 参考值（目标 50%） */
+#define LEARNING_RATE   0.1f              /* 梯度下降学习率 */
+#define PGD_ITERATIONS  100               /* 投影梯度下降迭代次数 */
 
-#define ML_PRED_WINDOW 10
-#define N_PRED_FEAT 6 
-float input_features[ML_PRED_WINDOW * N_PRED_FEAT];
-// this array contains:
-// - predicted future PV power
-// - predicted future load power
-float output[2];
+/* ========================================================================
+ * ML 功率预测配置
+ * ======================================================================== */
+#define ML_PRED_WINDOW 10   /* 预测滑动窗口大小 */
+#define N_PRED_FEAT 6       /* 特征数量：辐照度、温度、小时、星期、PV、负载 */
+float input_features[ML_PRED_WINDOW * N_PRED_FEAT];  /* ML 输入特征缓冲区 */
+float output[2];                                   /* ML 输出：[预测 PV, 预测负载] */
 
-float curr_load = 2.0f;
-float curr_pv = 0.0f;
-float curr_hour = 6.0f;
+/* ========================================================================
+ * 环境仿真变量（模拟真实微电网场景）
+ * ======================================================================== */
+float curr_load = 2.0f;       /* 当前负载消耗（kW） */
+float curr_pv = 0.0f;         /* 当前 PV 发电（kW） */
+float curr_hour = 6.0f;       /* 仿真时钟（小时） */
 int16_t temp_raw = 0;
-float curr_temp = 22.0f;
-float curr_day = 0.5f; // day of week normalized
-float cloud_cover = 0.3f;
-bool is_sunny_day = true;
-float base_load = 2.0f;
-bool high_demand_period = false;
+float curr_temp = 22.0f;      /* 当前温度（°C） */
+float curr_day = 0.5f;        /* 星期（归一化 0~1） */
+float cloud_cover = 0.3f;     /* 云量覆盖（0~1） */
+bool is_sunny_day = true;     /* 是否晴天 */
+float base_load = 2.0f;       /* 基础负载（kW） */
+bool high_demand_period = false;  /* 是否高需求时段 */
 
+/* ========================================================================
+ * CoAP 资源声明（在 resources/ 目录下定义）
+ * ======================================================================== */
 extern coap_resource_t 
-    res_obj_ctrl,
-    res_ugrid_state, 
-    res_mpc_params,
-    res_register;
+    res_obj_ctrl,     /* GET/PUT /ctrl/obj: 查看/设置手动功率目标 */
+    res_ugrid_state,  /* GET /dev/state: 返回微电网全局状态 */
+    res_mpc_params,   /* PUT /ctrl/mpc: 远程调节 MPC 参数 */
+    res_register;     /* POST /dev/register: 接收电池注册 */
 
-static struct etimer et_compute;
+/* 定时器定义 */
+static struct etimer et_compute;  /* <- sys/etimer.h */
 
 PROCESS_NAME(ugrid_controller);
 
-// battery status print
+/* ========================================================================
+ * 打印所有已注册电池的状态
+ * ======================================================================== */
 static void print_battery_status(void) {
     LOG_INFO("\n");
     LOG_INFO("===============BATTERY STATUS================\n");
@@ -123,11 +182,21 @@ static void print_battery_status(void) {
     LOG_INFO("\n");
 }
 
+/* ========================================================================
+ * 环境仿真：模拟 PV 发电、负载消耗、天气变化
+ *
+ * 这是 uGridController 的"世界模型"，在没有真实硬件时模拟微电网环境：
+ *   - PV 发电：基于太阳高度角、云量、湍流模拟
+ *   - 负载消耗：基于时段特征（早高峰、午高峰、晚高峰）+ 随机事件
+ *   - 天气变化：云量随机漂移，晴天/阴天交替
+ *
+ * 最后将环境数据归一化后填入 ML 预测特征缓冲区
+ * ======================================================================== */
 static void update_env() {
-    curr_hour += 0.5f; 
+    curr_hour += 0.5f;  /* 每次推进 0.5 小时 */
     if(curr_hour >= 24.0f) {
         curr_hour = 0.0f;
-        is_sunny_day = (random_rand() % 100) > 30;
+        is_sunny_day = (random_rand() % 100) > 30;  /* <- lib/random.h */
         curr_day += 0.1f;
         if (curr_day > 1.0f) {
             curr_day = 0.0f;
@@ -236,13 +305,27 @@ static void update_env() {
     LOG_INFO("Net Power:   \t%s%d.%d kW%s\n", net_power > 10e-2 ? VERDE : ROSSO, (int)net_power, abs((int)(net_power * 100.0f) % 100), RESET);
 }
 
+/* ========================================================================
+ * MPC 优化：投影梯度下降算法
+ *
+ * 目标函数：min Σ(alpha * price * u_i + beta * u_i² + gama * (soc_i + K*u_i - soc_ref)²)
+ *   - 第一项：电网电价成本
+ *   - 第二项：电池衰减惩罚（功率越大衰减越快）
+ *   - 第三项：SoC 偏离参考值的惩罚（保持电池在健康区间）
+ *
+ * 约束：|u_i| <= BAT_MAX_POWER_KW（功率物理限制）
+ *
+ * 算法：Projected Gradient Descent（投影梯度下降）
+ *   每轮迭代：计算梯度 → 沿负梯度方向更新 → 投影到可行域（钳位）
+ *   迭代 100 次后停止（轻量级，适合嵌入式设备）
+ * ======================================================================== */
 static void run_mpc() {
 
     LOG_INFO("\n");
     LOG_INFO("================MPC OPTIMIZATION==============\n");
 
-    // compute predicted PV and load power
-    power_predictor_regress(input_features, ML_PRED_WINDOW * N_PRED_FEAT, output, 2);
+    /* 调用 ML 模型预测未来 PV 发电和负载消耗 */
+    power_predictor_regress(input_features, ML_PRED_WINDOW * N_PRED_FEAT, output, 2);  /* <- includes/power_predictor_model.h (emlearn) */
     
     // clamp values 
     if ( output[0] < 0 ) {
@@ -349,43 +432,50 @@ static void run_mpc() {
 }
 
 
+/* ========================================================================
+ * 电池状态通知回调（CoAP OBSERVE 客户端）
+ *
+ * 当 BatteryController 的 /dev/state 资源发生变化时，
+ * 此回调函数会被 Contiki 的 OBSERVE 客户端机制自动调用。
+ * 它解析 JSON payload 并更新对应电池节点的本地状态。
+ * ======================================================================== */
     static void 
 battery_notification_handler(coap_observee_t *obs,
         void *notification, coap_notification_flag_t flag)
 {
     if(!notification) {
-        LOG_WARN("[OBSERVE] NULL notification (flag=%d)\n", flag);
+        LOG_WARN("[OBSERVE] NULL notification (flag=%d)\n", flag);  /* <- sys/log.h */
         return;
     }
 
     const uint8_t *payload = NULL;
-    int len = coap_get_payload(notification, &payload);
+    int len = coap_get_payload(notification, &payload);  /* <- coap-engine.h */
     if(len <= 0) return;
 
     static char s[128];
     if(len >= (int)sizeof(s)) len = sizeof(s) - 1;
-    memcpy(s, payload, len);
+    memcpy(s, payload, len);  /* <- string.h */
     s[len] = '\0';
 
     int voltage=0, current=0, temperature=0, soc=0, soh=0, state=0;
     int n = sscanf(s,
             "{\"V\":%d,\"I\":%d,\"T\":%d,\"S\":%d,\"H\":%d,\"St\":%d}",
-            &voltage, &current, &temperature, &soc, &soh, &state);
+            &voltage, &current, &temperature, &soc, &soh, &state);  /* <- stdio.h */
 
     if(n != 6) {
-        LOG_WARN("[OBS] Bad payload (sscanf=%d): %s\n", n, s);
+        LOG_WARN("[OBS] Bad payload (sscanf=%d): %s\n", n, s);  /* <- sys/log.h */
         return;
     }
 
     for(int i=0; i<battery_count; i++) {
-        if(uip_ipaddr_cmp(&batteries[i].ip, &obs->endpoint.ipaddr)) {
+        if(uip_ipaddr_cmp(&batteries[i].ip, &obs->endpoint.ipaddr)) {  /* <- net/ipv6/uip.h */
             batteries[i].current_soc     = (float)soc / 10000.0f;
             batteries[i].current_voltage = (float)voltage / 100.0f;
             batteries[i].current_temp    = (float)temperature / 100.0f;
             batteries[i].current_soh     = (float)soh / 10000.0f;
             batteries[i].current_current = (float)current / 100.0f;
             batteries[i].actual_power    = (float)(voltage * current) / 10000000.0f;
-            batteries[i].last_update_time = clock_seconds();
+            batteries[i].last_update_time = clock_seconds();  /* <- sys/clock.h */
             batteries[i].state = state;
             break;
         }
@@ -393,11 +483,26 @@ battery_notification_handler(coap_observee_t *obs,
 }
 
 
+/* 空回调：用于 COAP_BLOCKING_REQUEST 发送功率指令后不需要处理响应 */
 static void empty_cb(coap_message_t *response) {
     (void)response;
     /* Silent callback */
 }
 
+/* ========================================================================
+ * Contiki-NG 进程定义
+ *
+ * 生命周期：
+ *   1. 初始化：激活 4 个 CoAP 资源（注册、状态、MPC 参数、手动目标）
+ *   2. 主循环（每 5 秒）：
+ *      - 更新环境仿真（PV/负载/天气）
+ *      - ML 功率预测
+ *      - MPC 优化计算
+ *      - 向每个非隔离电池下发功率指令（CoAP PUT /dev/power）
+ *      - 打印电池状态汇总
+ *   3. 消息事件（PROCESS_EVENT_MSG）：
+ *      - 新电池注册后触发，为该电池建立 OBSERVE 订阅
+ * ======================================================================== */
 PROCESS(ugrid_controller, "uGrid");
 AUTOSTART_PROCESSES(&ugrid_controller);
 
@@ -409,93 +514,100 @@ PROCESS_THREAD(ugrid_controller, ev, data) {
 
     PROCESS_BEGIN();
 
-    // avoid errors with emlearn
-    printf("%p\n", eml_error_str);
-    printf("%p\n", eml_net_activation_function_strs);
+    /* 避免 emlearn 符号被链接器优化掉 */
+    printf("%p\n", eml_error_str);                      /* <- stdio.h + includes/power_predictor_model.h */
+    printf("%p\n", eml_net_activation_function_strs);   /* <- stdio.h + includes/power_predictor_model.h */
 
-    leds_on(LEDS_GREEN);
+    leds_on(LEDS_GREEN);  /* <- dev/leds.h */
 
-    coap_activate_resource(&res_register, "dev/register");
-    coap_activate_resource(&res_ugrid_state, "dev/state");
-    coap_activate_resource(&res_mpc_params, "ctrl/mpc");
-    coap_activate_resource(&res_obj_ctrl, "ctrl/obj");
+    /* 注册 4 个 CoAP 资源 */
+    coap_activate_resource(&res_register, "dev/register");    /* <- coap-engine.h */
+    coap_activate_resource(&res_ugrid_state, "dev/state");    /* <- coap-engine.h */
+    coap_activate_resource(&res_mpc_params, "ctrl/mpc");      /* <- coap-engine.h */
+    coap_activate_resource(&res_obj_ctrl, "ctrl/obj");        /* <- coap-engine.h */
 
-
-    LOG_INFO("[INIT] CoAP resources activated\n");
+    LOG_INFO("[INIT] CoAP resources activated\n");            /* <- sys/log.h */
     LOG_INFO("[INIT] Ready to accept battery registrations\n");
     LOG_INFO("\n");
 
-    etimer_set(&et_compute, FREQ_COMPUTING);
+    etimer_set(&et_compute, FREQ_COMPUTING);  /* <- sys/etimer.h */
 
     while(1) {
-        PROCESS_WAIT_EVENT();
+        PROCESS_WAIT_EVENT();  /* <- contiki.h */
 
+        /* ====================================================================
+         * 定时器事件：每 5 秒执行一次环境仿真 + MPC 优化 + 功率下发
+         * ==================================================================== */
         if(ev == PROCESS_EVENT_TIMER && data == &et_compute) {
-            leds_on(LEDS_BLUE);
+            leds_on(LEDS_BLUE);  /* <- dev/leds.h */
             update_env(); 
             run_mpc(); 
 
             LOG_INFO("\n");
             LOG_INFO("===========OPTIMIZATION RESULTS===============\n");
 
-            // send message to single clients
+            /* 向每个已注册电池下发功率指令 */
             for(i = 0; i < battery_count; i++) {
                 if (!batteries[i].active) continue;
 
-                // double check also at uGridSide
-                // if battery isolated not sending command
+                /* 已隔离的电池不发送指令 */
                 if (batteries[i].state == STATE_ISOLATED) {
-                    LOG_INFO("Battery #%d: state=ISO, skipping command\n", i);
+                    LOG_INFO("Battery #%d: state=ISO, skipping command\n", i);  /* <- sys/log.h */
                     continue;
                 }
 
-                // set request ip
-                memset(&ep, 0, sizeof(ep));
-                memset(req, 0, sizeof(coap_message_t));
-                uip_ipaddr_copy(&ep.ipaddr, &batteries[i].ip);
+                /* 构建 CoAP PUT 请求目标端点 */
+                memset(&ep, 0, sizeof(ep));                          /* <- string.h */
+                memset(req, 0, sizeof(coap_message_t));              /* <- string.h */
+                uip_ipaddr_copy(&ep.ipaddr, &batteries[i].ip);       /* <- net/ipv6/uip.h */
                 ep.port = UIP_HTONS(COAP_DEFAULT_PORT);
 
-                coap_init_message(req, COAP_TYPE_CON, COAP_PUT, 0);
-                coap_set_header_uri_path(req, "dev/power");
+                coap_init_message(req, COAP_TYPE_CON, COAP_PUT, 0);  /* <- coap-engine.h */
+                coap_set_header_uri_path(req, "dev/power");          /* <- coap-engine.h */
 
+                /* 优先使用手动目标，否则使用 MPC 计算结果 */
                 float cmd_kw = batteries[i].has_objective
                     ? batteries[i].objective_power
                     : batteries[i].optimal_u;
 
                 int cmd_scaled = (int)(cmd_kw * 1000);
-                snprintf(pl, sizeof(pl), "{\"u\":%d}", cmd_scaled);
-                coap_set_payload(req, (uint8_t*)pl, strlen(pl));
+                snprintf(pl, sizeof(pl), "{\"u\":%d}", cmd_scaled);  /* <- stdio.h */
+                coap_set_payload(req, (uint8_t*)pl, strlen(pl));     /* <- coap-engine.h */
 
-                LOG_INFO("Battery #%d: [%s]: %s%d.%d kW%s\n",
+                LOG_INFO("Battery #%d: [%s]: %s%d.%d kW%s\n",       /* <- sys/log.h */
                         i,
                         batteries[i].has_objective ? "OBJ" : "MPC",
                         cmd_kw > 0 ? VERDE : ROSSO,
                         (int)(cmd_kw), abs((int)(cmd_kw * 100.0f)) % 100,
                         RESET );
 
-                COAP_BLOCKING_REQUEST(&ep, req, empty_cb);
+                /* 发送 CoAP PUT 请求（阻塞等待响应） */
+                COAP_BLOCKING_REQUEST(&ep, req, empty_cb);           /* <- coap-blocking-api.h */
             }
 
             print_battery_status();
 
-            etimer_reset(&et_compute);
-            leds_off(LEDS_BLUE);
+            etimer_reset(&et_compute);  /* <- sys/etimer.h */
+            leds_off(LEDS_BLUE);        /* <- dev/leds.h */
         }
 
-        /* Setup observe */
+        /* ====================================================================
+         * 消息事件：新电池注册后触发，为该电池建立 OBSERVE 订阅
+         * ==================================================================== */
         if(ev == PROCESS_EVENT_MSG) {
 
             for(i = 0; i < battery_count; i++) {
                 if(batteries[i].active && !batteries[i].obs_requested) {
-                    memset(&ep, 0, sizeof(ep));
-                    uip_ipaddr_copy(&ep.ipaddr, &batteries[i].ip);
+                    memset(&ep, 0, sizeof(ep));                          /* <- string.h */
+                    uip_ipaddr_copy(&ep.ipaddr, &batteries[i].ip);       /* <- net/ipv6/uip.h */
                     ep.port = UIP_HTONS(COAP_DEFAULT_PORT);
 
-                    LOG_INFO("[OBSERVE] Setting up observation for Battery #%d: ", i);
-                    LOG_INFO_6ADDR(&batteries[i].ip);
+                    LOG_INFO("[OBSERVE] Setting up observation for Battery #%d: ", i);  /* <- sys/log.h */
+                    LOG_INFO_6ADDR(&batteries[i].ip);                    /* <- sys/log.h */
                     LOG_INFO_("\n");
 
-                    batteries[i].obs = coap_obs_request_registration(
+                    /* 向电池发送 CoAP OBSERVE 订阅请求 */
+                    batteries[i].obs = coap_obs_request_registration(    /* <- coap-observe-client.h */
                             &ep, 
                             "dev/state", 
                             battery_notification_handler, 
@@ -503,9 +615,9 @@ PROCESS_THREAD(ugrid_controller, ev, data) {
                             );
 
                     if(batteries[i].obs != NULL) {
-                        LOG_INFO("[OBSERVE] ✓ Observation registered successfully for Battery #%d\n", i);
+                        LOG_INFO("[OBSERVE] ✓ Observation registered successfully for Battery #%d\n", i);  /* <- sys/log.h */
                     } else {
-                        LOG_WARN("[OBSERVE] ✗ Failed to register observation for Battery #%d\n", i);
+                        LOG_WARN("[OBSERVE] ✗ Failed to register observation for Battery #%d\n", i);  /* <- sys/log.h */
                     }
 
                     batteries[i].obs_requested = true;
