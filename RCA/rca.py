@@ -1,3 +1,32 @@
+"""
+============================================================================
+RCA (Remote Control Application) — 远程控制应用（云端层）
+============================================================================
+
+【架构定位】
+  本系统运行在云端层（Cloud Layer），是整个 Smart-LBSS 系统的"大脑"：
+    - 通过 CoAP 协议轮询 uGridController 获取微电网状态
+    - 将遥测数据存储到 MySQL 数据库
+    - 通过 MQTT 发布告警信息
+    - 提供 Flask REST API 供 CA（客户端应用）查询和控制
+
+【核心功能】
+  1. CoAP 轮询：每 5 秒向 uGridController 请求 /dev/state（CBOR/JSON）
+  2. 数据存储：将电池遥测、告警、MPC 参数持久化到 MySQL
+  3. 告警分发：SoH/SoC/温度超阈值时写入数据库并发布 MQTT 告警
+  4. 目标控制：支持 full_discharge、target_soc、detach 三种电池控制模式
+  5. REST API：提供状态查询、目标设置、MPC 参数调节、历史记录等接口
+
+【数据流】
+  uGridController → CoAP GET /dev/state → RCA 解析 → MySQL 存储 + MQTT 告警
+  CA 客户端 → HTTP POST /api/batteries/.../objective → RCA → CoAP PUT → uGridController
+
+【启动方式】
+  python rca.py
+  启动后监听 http://0.0.0.0:3000
+============================================================================
+"""
+
 import json
 import logging
 import signal
@@ -16,10 +45,10 @@ from coapthon import defines
 import cbor2
 
 # ---------------------------------------------------------------------------
-# CONFIGURAZIONE
+# 配置
 # ---------------------------------------------------------------------------
 
-# MySQL
+# MySQL 数据库配置
 MYSQL_CONFIG = {
     "host": "localhost",
     "user": "root",
@@ -27,29 +56,30 @@ MYSQL_CONFIG = {
     "port": 3306,
 }
 DB_NAME = "ugrid"
-DROP_SCHEMA_ON_STARTUP = False 
+DROP_SCHEMA_ON_STARTUP = False  # 启动时是否删除已有表（调试用）
 
-# MQTT
+# MQTT 配置
 MQTT_BROKER_HOST = "localhost"
 MQTT_BROKER_PORT = 1883
 MQTT_ALERT_TOPIC_BASE = "ugrid/alerts"
 
+# uGrid 设备配置（CoAP 端点地址）
 UGRIDS = {
     "ug1": {
         "coap_state_uri": "coap://[fd00::f6ce:36ac:9afa:6be2]/dev/state",
     },
 }
 
-# Polling
-POLL_INTERVAL_SEC = 5.0
-CONTENT_FORMAT_CBOR = 60  
-CONTENT_FORMAT_JSON = 50  
-ENERGY_PRICE_EUR_PER_KWH = 0.25
-SOC_LOW_WARNING = 0.15      
-SOH_LOW_CRITICAL = 0.80     
-TEMP_HIGH_CRITICAL = 50.0  
-MAX_CHARGE_POWER_KW = 5.0   
-MAX_DISCH_POWER_KW  = -5.0  
+# 轮询与告警阈值
+POLL_INTERVAL_SEC = 5.0              # 轮询间隔（秒）
+CONTENT_FORMAT_CBOR = 60             # CoAP CBOR 内容格式码
+CONTENT_FORMAT_JSON = 50             # CoAP JSON 内容格式码
+ENERGY_PRICE_EUR_PER_KWH = 0.25      # 电价（€/kWh）
+SOC_LOW_WARNING = 0.15               # SoC 低电量告警阈值
+SOH_LOW_CRITICAL = 0.80              # SoH 严重退化告警阈值
+TEMP_HIGH_CRITICAL = 50.0            # 高温告警阈值（°C）
+MAX_CHARGE_POWER_KW = 5.0            # 手动控制最大充电功率（kW）
+MAX_DISCH_POWER_KW  = -5.0           # 手动控制最大放电功率（kW）
 
 logging.basicConfig(
     level=logging.INFO,
@@ -60,10 +90,11 @@ logger = logging.getLogger("RCA")
 app = Flask(__name__)
 
 # ---------------------------------------------------------------------------
-# HELPERS MYSQL
+# MySQL 数据库操作
 # ---------------------------------------------------------------------------
 
 def get_mysql_connection(database=None):
+    """创建 MySQL 连接（可选指定数据库名）"""
     cfg = dict(MYSQL_CONFIG)
     if database:
         cfg["database"] = database
@@ -71,6 +102,13 @@ def get_mysql_connection(database=None):
 
 
 def init_database():
+    """
+    初始化数据库：创建数据库和 4 张表
+      - telemetry: 电池遥测数据（每 5 秒一条）
+      - objectives: 电池控制目标（full_discharge/target_soc/detach）
+      - mpc_params: MPC 优化参数（alpha/beta/gamma/price）
+      - alerts: 告警记录（SoH/SoC/温度超阈值）
+    """
     conn = get_mysql_connection()
     conn.autocommit = True
     cur = conn.cursor()
@@ -150,10 +188,11 @@ def init_database():
 
 
 # ---------------------------------------------------------------------------
-# HELPERS COAP (CoAPthon3 implementation)
+# CoAP 通信（CoAPthon3 实现）
 # ---------------------------------------------------------------------------
 
 def _parse_coap_uri(uri: str) -> Tuple[str, int, str]:
+    """解析 CoAP URI，返回 (host, port, path)"""
     parsed = urlparse(uri)
     host = parsed.hostname
     port = parsed.port or 5683
@@ -163,6 +202,10 @@ def _parse_coap_uri(uri: str) -> Tuple[str, int, str]:
     return host, port, path
 
 def coap_get(uri: str, timeout: float = 5.0) -> Tuple[bytes, Optional[int]]:
+    """
+    发送 CoAP GET 请求
+    返回: (payload_bytes, content_format)
+    """
     host, port, path = _parse_coap_uri(uri)
     client = None
     try:
@@ -187,6 +230,10 @@ def coap_get(uri: str, timeout: float = 5.0) -> Tuple[bytes, Optional[int]]:
             client.stop()
 
 def coap_put(uri: str, payload: bytes, timeout: float = 5.0) -> bytes:
+    """
+    发送 CoAP PUT 请求
+    返回: 响应 payload
+    """
     host, port, path = _parse_coap_uri(uri)
     client = None
     try:
@@ -209,10 +256,11 @@ def coap_put(uri: str, payload: bytes, timeout: float = 5.0) -> bytes:
             client.stop()
 
 # ---------------------------------------------------------------------------
-# HELPERS Logica uGrid
+# uGrid 控制逻辑
 # ---------------------------------------------------------------------------
 
 def ugrid_obj_uri(ugrid_id: str) -> str:
+    """根据 uGrid 的 state URI 构造出 obj（目标控制）URI"""
     cfg = UGRIDS[ugrid_id]
     state_uri = cfg["coap_state_uri"]
     host, port, _ = _parse_coap_uri(state_uri)
@@ -225,22 +273,29 @@ def ugrid_obj_uri(ugrid_id: str) -> str:
     return f"coap://{host_str}:{port}/ctrl/obj"
 
 def send_ugrid_objective(ugrid_id: str, battery_index: int, power_kw: float):
+    """通过 CoAP PUT 向 uGridController 发送电池功率目标"""
     uri = ugrid_obj_uri(ugrid_id)
     body = {"idx": battery_index, "power_kw": int(power_kw * 100), "clear": 0}
     payload = json.dumps(body).encode("utf-8")
     coap_put(uri, payload)
 
 def clear_ugrid_objective(ugrid_id: str, battery_index: int):
+    """通过 CoAP PUT 清除电池的手动功率目标（恢复 MPC 自动控制）"""
     uri = ugrid_obj_uri(ugrid_id)
     body = {"idx": battery_index, "power_kw": 0, "clear": 1}
     payload = json.dumps(body).encode("utf-8")
     coap_put(uri, payload)
 
 # ---------------------------------------------------------------------------
-# DECODIFICA /dev/state (JSON o CBOR)
+# 状态解码（支持 CBOR 和 JSON 两种格式）
 # ---------------------------------------------------------------------------
 
 def _decode_state_from_cbor(obj: Any) -> Dict[str, Any]:
+    """
+    解析 CBOR 编码的微电网状态数据
+    CBOR 结构: {0: 电池数量, 1: 负载×100, 2: PV×100, 3: [电池数组]}
+    每块电池: [idx, u×100, S×100, p×100, V×100, I×100, T×100, H×100, state]
+    """
     if not isinstance(obj, dict):
         raise ValueError("CBOR root non è una mappa")
     if any(isinstance(k, str) for k in obj.keys()):
@@ -272,6 +327,10 @@ def _decode_state_from_cbor(obj: Any) -> Dict[str, Any]:
     }
 
 def decode_ugrid_state(payload: bytes, content_format: Optional[int]) -> Dict[str, Any]:
+    """
+    解码 uGrid 状态数据：优先根据 content_format 判断 CBOR/JSON，
+    如果都无法解析则尝试 fallback 到另一种格式
+    """
     if content_format == CONTENT_FORMAT_CBOR:
         if cbor2 is None:
             raise RuntimeError("Risposta CBOR ma 'cbor2' mancante")
@@ -290,10 +349,12 @@ def decode_ugrid_state(payload: bytes, content_format: Optional[int]) -> Dict[st
         raise ValueError("Impossibile decodificare stato (ne JSON ne CBOR valido)")
 
 # ---------------------------------------------------------------------------
-# MQTT 
+# MQTT 告警发布
 # ---------------------------------------------------------------------------
 
 class MqttPublisher:
+    """MQTT 告警发布器：连接到 Mosquitto broker 并发布告警消息"""
+    
     def __init__(self, host: str, port: int):
         self.host = host
         self.port = port
@@ -303,6 +364,7 @@ class MqttPublisher:
         self._connected = False
 
     def start(self):
+        """连接到 MQTT broker 并启动后台事件循环"""
         try:
             self.client.connect(self.host, self.port, keepalive=60)
             self.client.loop_start()
@@ -310,6 +372,7 @@ class MqttPublisher:
             logger.error(f"Errore connessione MQTT broker: {e}")
 
     def stop(self):
+        """断开 MQTT 连接"""
         try:
             self.client.loop_stop()
             self.client.disconnect()
@@ -317,6 +380,7 @@ class MqttPublisher:
             pass
 
     def on_connect(self, client, userdata, flags, rc):
+        """连接成功回调"""
         if rc == 0:
             self._connected = True
             logger.info("Connesso al broker MQTT")
@@ -324,10 +388,15 @@ class MqttPublisher:
             logger.error(f"Connessione MQTT fallita, rc={rc}")
 
     def on_disconnect(self, client, userdata, rc):
+        """断开连接回调"""
         self._connected = False
         logger.warning("Disconnesso dal broker MQTT")
 
     def publish_alert(self, level, ugrid_id, battery_index, message, payload):
+        """
+        发布告警到 MQTT
+        Topic 格式: ugrid/alerts/{level}/{ugrid_id}/{battery_index}
+        """
         topic_parts = [MQTT_ALERT_TOPIC_BASE, level, ugrid_id]
         if battery_index is not None:
             topic_parts.append(str(battery_index))
@@ -345,10 +414,21 @@ class MqttPublisher:
             logger.error(f"Errore pubblicando alert MQTT: {e}")
 
 # ---------------------------------------------------------------------------
-# CORE RCA
+# RCA 核心类
 # ---------------------------------------------------------------------------
 
 class RCA:
+    """
+    远程控制应用核心类
+    
+    职责：
+      1. 轮询 uGridController 获取状态（CoAP GET /dev/state）
+      2. 解析并存储遥测数据到 MySQL
+      3. 检查告警条件并发布 MQTT 告警
+      4. 执行电池控制目标（full_discharge / target_soc / detach）
+      5. 提供 Flask REST API
+    """
+    
     def __init__(self):
         self.stop_event = threading.Event()
         self.mqtt_pub = MqttPublisher(MQTT_BROKER_HOST, MQTT_BROKER_PORT)
@@ -359,8 +439,9 @@ class RCA:
         }
         self.latest_batt_extra: Dict[Tuple[str, int], Dict[str, Any]] = {}
 
-    # --- DB Helpers ------------------------------------------------
+    # --- 数据库操作 ------------------------------------------------
     def insert_telemetry(self, ugrid_id, battery_index, row):
+        """插入一条电池遥测记录到 telemetry 表"""
         with self.db_lock:
             conn = get_mysql_connection(DB_NAME)
             try:
@@ -379,6 +460,7 @@ class RCA:
                 conn.close()
 
     def insert_alert(self, level, ugrid_id, battery_index, message, payload):
+        """插入告警记录到 alerts 表，同时发布 MQTT 告警"""
         with self.db_lock:
             conn = get_mysql_connection(DB_NAME)
             try:
@@ -393,6 +475,7 @@ class RCA:
         self.mqtt_pub.publish_alert(level, ugrid_id, battery_index, message, payload)
 
     def upsert_objective(self, ugrid_id, battery_index, mode, target_soc):
+        """插入或更新电池控制目标（UPSERT）"""
         with self.db_lock:
             conn = get_mysql_connection(DB_NAME)
             try:
@@ -407,6 +490,7 @@ class RCA:
                 conn.close()
 
     def delete_objective(self, ugrid_id, battery_index):
+        """删除电池控制目标"""
         with self.db_lock:
             conn = get_mysql_connection(DB_NAME)
             try:
@@ -418,6 +502,7 @@ class RCA:
                 conn.close()
 
     def get_objectives_for_ugrid(self, ugrid_id):
+        """查询指定 uGrid 的所有电池控制目标"""
         with self.db_lock:
             conn = get_mysql_connection(DB_NAME)
             try:
@@ -432,7 +517,11 @@ class RCA:
         return out
 
     def get_latest_status(self):
-        # (Logica identica all'originale per aggregare dati DB)
+        """
+        获取所有 uGrid 的最新状态
+        查询每个 (ugrid_id, battery_index) 的最新一条遥测记录，
+        聚合为 {ugrid_id: {load_kw, pv_kw, grid_power_kw, batteries: [...]}}
+        """
         with self.db_lock:
             conn = get_mysql_connection(DB_NAME)
             try:
@@ -489,14 +578,22 @@ class RCA:
 
         return res
 
-    # --- Logica Controllo (sincrona) ---
+    # --- 控制逻辑（同步执行） ---
     def apply_objective(self, ugrid_id, battery_index, battery_state, objective):
+        """
+        执行电池控制目标
+        
+        三种模式：
+          full_discharge — 全速放电直到 SoC < 5%
+          target_soc     — 充/放电到目标 SoC（±2% 容差）
+          detach         — 断开电池（功率设为 0）
+        """
         mode, target_soc = objective
         soc = battery_state.get("soc") or battery_state.get("S")
         if soc is None:
             return
 
-        # FULL DISCHARGE
+        # FULL DISCHARGE：全速放电
         if mode == "full_discharge":
             if soc > 0.05:
                 power_kw = MAX_DISCH_POWER_KW
@@ -506,7 +603,7 @@ class RCA:
                     self.logger.error(f"Errore CoAP full_discharge: {e}")
                 return
             
-            # Completato
+            # 放电完成，清除目标
             try:
                 clear_ugrid_objective(ugrid_id, battery_index)
             except Exception: pass
@@ -514,10 +611,11 @@ class RCA:
             self.insert_alert("info", ugrid_id, battery_index, "Scarica completa terminata", {"soc": soc})
             return
 
-        # TARGET SOC
+        # TARGET SOC：充/放电到目标 SoC
         if mode == "target_soc":
             if target_soc is None: return
             if abs(soc - target_soc) <= 0.02:
+                # 已到达目标（±2% 容差），清除目标
                 try:
                     clear_ugrid_objective(ugrid_id, battery_index)
                 except Exception: pass
@@ -525,6 +623,7 @@ class RCA:
                 self.insert_alert("info", ugrid_id, battery_index, "Target SoC raggiunto", {"soc": soc})
                 return
 
+            # 计算功率：误差越大功率越大（比例控制）
             error = target_soc - soc
             if error > 0:
                 power_kw = min(MAX_CHARGE_POWER_KW, MAX_CHARGE_POWER_KW * error * 5.0)
@@ -537,7 +636,7 @@ class RCA:
                 self.logger.error(f"Errore CoAP target_soc: {e}")
             return
 
-        # DETACH
+        # DETACH：断开电池
         if mode == "detach":
             try:
                 send_ugrid_objective(ugrid_id, battery_index, 0.0)
@@ -546,23 +645,32 @@ class RCA:
             self.insert_alert("info", ugrid_id, battery_index, "Batteria staccata (detach)", {})
             return
 
-    # --- Polling Loop ---
+    # --- 轮询循环 ---
     def _handle_ugrid_state(self, ugrid_id, state, dt_hours):
-        # (Logica identica per calcoli e parsing)
+        """
+        处理一次 uGrid 状态数据：
+          1. 计算电网功率和收益
+          2. 存储每块电池的遥测数据
+          3. 检查告警条件（SoH/SoC/温度）
+          4. 执行电池控制目标
+        """
         bats = state.get("bats", []) or []
         load_kw = state.get("load_kw")
         pv_kw = state.get("pv_kw")
         price = self.ugrid_price.get(ugrid_id, ENERGY_PRICE_EUR_PER_KWH)
         
+        # 计算电网功率：load + battery_total - pv
         grid_power_kw = None
         if load_kw is not None and pv_kw is not None:
             total_p = sum(b.get("p", 0.0) or 0.0 for b in bats)
             grid_power_kw = load_kw + total_p - pv_kw
         
+        # 计算收益：负电网功率 × 电价 × 时间
         profit_eur_total = None
         if grid_power_kw is not None and dt_hours > 0:
             profit_eur_total = -price * grid_power_kw * dt_hours
         
+        # 按功率比例分配每块电池的收益贡献
         total_abs_power = sum(abs(b.get("p", 0.0) or 0.0) for b in bats) or 1.0
         objectives = self.get_objectives_for_ugrid(ugrid_id)
 
@@ -589,7 +697,7 @@ class RCA:
             }
             self.insert_telemetry(ugrid_id, idx, row)
 
-            # Alerts
+            # 告警检查
             if soh is not None and soh < SOH_LOW_CRITICAL:
                 self.insert_alert("critical", ugrid_id, idx, f"SoH critico {soh*100:.1f}%", {"soh": soh})
             if temp is not None and temp > TEMP_HIGH_CRITICAL:
@@ -597,10 +705,15 @@ class RCA:
             if soc is not None and soc < SOC_LOW_WARNING:
                 self.insert_alert("warning", ugrid_id, idx, f"SoC basso {soc*100:.1f}%", {"soc": soc})
 
+            # 执行控制目标
             if idx in objectives:
                 self.apply_objective(ugrid_id, idx, b, objectives[idx])
 
     def poll_loop(self):
+        """
+        主轮询循环（运行在独立线程中）
+        每 POLL_INTERVAL_SEC 秒轮询所有 uGrid 的状态
+        """
         logger.info("Poll loop avviato (CoAPthon sync)")
         last_ts = {ugrid_id: time.time() for ugrid_id in UGRIDS.keys()}
 
@@ -609,11 +722,11 @@ class RCA:
             for ugrid_id, cfg in UGRIDS.items():
                 uri = cfg["coap_state_uri"]
                 try:
-                    # Chiamata sincrona, non c'è await
+                    # 同步 CoAP 请求
                     payload, cf = coap_get(uri, timeout=3.0)
                     state = decode_ugrid_state(payload, cf)
                     
-                    # Normalizzazione numerica
+                    # 数值类型归一化
                     if isinstance(state.get("load_kw"), str): state["load_kw"] = float(state["load_kw"])
                     if isinstance(state.get("pv_kw"), str): state["pv_kw"] = float(state["pv_kw"])
                     
@@ -628,11 +741,17 @@ class RCA:
 
             elapsed = time.time() - start_t
             wait_for = max(0.0, POLL_INTERVAL_SEC - elapsed)
-            # wait gestito con Event per uscire puliti se richiesto stop
+            # 使用 Event.wait 而非 time.sleep，以便能快速响应 stop 信号
             self.stop_event.wait(wait_for)
         logger.info("Poll loop terminato")
 
     def set_mpc_params(self, ugrid_id, alpha, beta, gamma, price):
+        """
+        设置 MPC 参数：
+          1. 更新本地电价缓存
+          2. 存储到 MySQL
+          3. 通过 CoAP PUT 下发到 uGridController
+        """
         if price is None: price = ENERGY_PRICE_EUR_PER_KWH
         self.ugrid_price[ugrid_id] = price
         
@@ -650,12 +769,11 @@ class RCA:
             finally:
                 conn.close()
         
-        # CoAP PUT
+        # 通过 CoAP PUT 下发到 uGridController
         uconf = UGRIDS.get(ugrid_id)
         if not uconf: return
         host, port, _ = _parse_coap_uri(uconf["coap_state_uri"])
         
-        # Ricostruzione path mpc
         if ":" in host and not host.startswith("["): host = f"[{host}]"
         mpc_uri = f"coap://{host}:{port}/ctrl/mpc"
         
@@ -670,27 +788,34 @@ class RCA:
             logger.error(f"Errore set_mpc_params CoAP: {e}")
 
     def start(self):
+        """启动 RCA：连接 MQTT + 启动轮询线程"""
         self.mqtt_pub.start()
-        # Thread per il loop di polling (che ora usa chiamate bloccanti)
         t = threading.Thread(target=self.poll_loop, daemon=True)
         t.start()
 
     def stop(self):
+        """停止 RCA：停止轮询 + 断开 MQTT"""
         self.stop_event.set()
         self.mqtt_pub.stop()
 
 rca = RCA()
 
 # ---------------------------------------------------------------------------
-# API HTTP (Flask)                                              
+# Flask REST API
 # ---------------------------------------------------------------------------
 
 @app.route("/api/status", methods=["GET"])
 def api_status():
+    """获取所有 uGrid 的最新状态"""
     return jsonify(rca.get_latest_status())
 
 @app.route("/api/batteries/<ugrid_id>/<int:bat_idx>/objective", methods=["POST", "DELETE"])
 def api_battery_objective(ugrid_id, bat_idx):
+    """
+    设置/删除电池控制目标
+    POST: 设置目标（mode: full_discharge / target_soc / detach）
+    DELETE: 清除目标
+    """
     if ugrid_id not in UGRIDS: abort(404, "uGrid sconosciuto")
     if request.method == "DELETE":
         try:
@@ -714,6 +839,7 @@ def api_battery_objective(ugrid_id, bat_idx):
 
 @app.route("/api/batteries/<ugrid_id>/<int:bat_idx>/history", methods=["GET"])
 def api_battery_history(ugrid_id, bat_idx):
+    """查询电池历史遥测数据（默认最近 100 条）"""
     limit = int(request.args.get("limit", 100))
     with rca.db_lock:
         conn = get_mysql_connection(DB_NAME)
@@ -729,6 +855,11 @@ def api_battery_history(ugrid_id, bat_idx):
 
 @app.route("/api/ugrids/<ugrid_id>/mpc_params", methods=["POST", "GET"])
 def api_mpc_params(ugrid_id):
+    """
+    查询/设置 MPC 参数
+    GET: 返回当前 MPC 参数
+    POST: 更新 alpha, beta, gamma, price
+    """
     if ugrid_id not in UGRIDS: abort(404, "uGrid sconosciuto")
     if request.method == "GET":
         with rca.db_lock:
@@ -755,6 +886,7 @@ def api_mpc_params(ugrid_id):
 
 @app.route("/api/alerts", methods=["GET"])
 def api_alerts():
+    """查询历史告警记录（默认最近 50 条）"""
     limit = int(request.args.get("limit", 50))
     with rca.db_lock:
         conn = get_mysql_connection(DB_NAME)
@@ -768,13 +900,20 @@ def api_alerts():
     return jsonify(rows)
 
 # ---------------------------------------------------------------------------
-# MAIN
+# 主入口
 # ---------------------------------------------------------------------------
 def main():
+    """
+    启动流程：
+      1. 初始化数据库
+      2. 启动 RCA（MQTT + 轮询线程）
+      3. 注册信号处理器（Ctrl+C 优雅退出）
+      4. 启动 Flask HTTP 服务器（端口 3000）
+    """
     init_database()
     rca.start()
     
-    # ctrl+C handler
+    # Ctrl+C 优雅退出
     def handle_sig(sig, frame):
         logger.info("Arresto RCA...")
         rca.stop()
@@ -783,7 +922,7 @@ def main():
     signal.signal(signal.SIGINT, handle_sig)
     signal.signal(signal.SIGTERM, handle_sig)
     
-    # Flask gestito nel main thread
+    # Flask 在主线程运行
     app.run(host="0.0.0.0", port=3000, debug=False, threaded=True)
 
 if __name__ == "__main__":

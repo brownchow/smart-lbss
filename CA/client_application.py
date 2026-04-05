@@ -1,3 +1,35 @@
+"""
+============================================================================
+CA (Client Application) — 客户端应用（云端层）
+============================================================================
+
+【架构定位】
+  本系统运行在云端层（Cloud Layer），是用户与 Smart-LBSS 系统的交互界面：
+    - 通过 HTTP REST API 与 RCA 通信，获取实时状态和发送控制命令
+    - 通过 MQTT 订阅异步告警消息
+    - 使用 curses 库提供终端 TUI 界面
+
+【核心功能】
+  1. 实时状态面板：显示每块电池的 SoC/SoH/温度/功率/控制目标/ETA
+  2. 告警面板：实时显示 MQTT 告警和 RCA 日志
+  3. 命令行控制：输入命令控制电池（放电、充电到目标 SoC、断开等）
+  4. 能量流可视化：显示 PV 发电、负载消耗、电网交互
+
+【启动方式】
+  python client_application.py
+  需要 RCA 先运行在 http://localhost:3000
+
+【可用命令】
+  fd <ugrid> <bat>          — 全速放电
+  setsoc <ugrid> <bat> <p>  — 充/放电到目标 SoC（百分比）
+  detach <ugrid> <bat>      — 断开电池
+  clear <ugrid> <bat>       — 清除控制目标
+  setmpc <ugrid> a b g [p]  — 修改 MPC 参数
+  pullalerts [N]            — 从数据库拉取最近 N 条告警
+  quit                      — 退出
+============================================================================
+"""
+
 import json
 import threading
 import time
@@ -9,55 +41,59 @@ import requests
 import paho.mqtt.client as mqtt
 
 # ---------------------------------------------------------------------------
-# CONFIG
+# 配置
 # ---------------------------------------------------------------------------
 
-RCA_BASE_URL = "http://localhost:3000"
-MQTT_BROKER_HOST = "localhost"
-MQTT_BROKER_PORT = 1883
-MQTT_ALERT_TOPIC = "ugrid/alerts/#"
-STATUS_REFRESH_INTERVAL = 2.0
-BATTERY_ENERGY_KWH = 13.5
+RCA_BASE_URL = "http://localhost:3000"       # RCA REST API 地址
+MQTT_BROKER_HOST = "localhost"                # MQTT broker 地址
+MQTT_BROKER_PORT = 1883                       # MQTT 端口
+MQTT_ALERT_TOPIC = "ugrid/alerts/#"           # 告警订阅主题（通配符）
+STATUS_REFRESH_INTERVAL = 2.0                 # 状态刷新间隔（秒）
+BATTERY_ENERGY_KWH = 13.5                     # 单块电池能量（kWh，Tesla Powerwall 级别）
 
 # ---------------------------------------------------------------------------
-# STATO CONDIVISO
+# 共享状态（多线程安全）
 # ---------------------------------------------------------------------------
 
 status_data_lock = threading.Lock()
-status_data: Dict[str, Any] = {}  # ultimo /api/status
+status_data: Dict[str, Any] = {}  # 最新 /api/status 响应数据
 
 alerts_lock = threading.Lock()
-alerts = deque(maxlen=100)  # (level, text)
+alerts = deque(maxlen=100)  # 告警队列：(level, text)，最多保留 100 条
 
-stop_event = threading.Event()
+stop_event = threading.Event()  # 全局停止信号
 
 # ---------------------------------------------------------------------------
-# HTTP helpers
+# HTTP 请求封装（与 RCA REST API 通信）
 # ---------------------------------------------------------------------------
 
 def rca_get(path: str, **kwargs):
+    """发送 GET 请求到 RCA"""
     url = RCA_BASE_URL + path
     r = requests.get(url, timeout=5, **kwargs)
     r.raise_for_status()
     return r.json()
 
 def rca_post(path: str, json_body: Optional[dict] = None):
+    """发送 POST 请求到 RCA"""
     url = RCA_BASE_URL + path
     r = requests.post(url, json=json_body, timeout=5)
     r.raise_for_status()
     return r.json()
 
 def rca_delete(path: str):
+    """发送 DELETE 请求到 RCA"""
     url = RCA_BASE_URL + path
     r = requests.delete(url, timeout=5)
     r.raise_for_status()
     return r.json()
 
 # ---------------------------------------------------------------------------
-# MQTT (alert asincroni)
+# MQTT 告警订阅（异步接收）
 # ---------------------------------------------------------------------------
 
 def on_mqtt_connect(client, userdata, flags, rc):
+    """MQTT 连接成功回调：订阅告警主题"""
     if rc == 0:
         with alerts_lock:
             alerts.append(("INFO", "[MQTT] Connesso, sottoscrizione agli alert..."))
@@ -67,6 +103,10 @@ def on_mqtt_connect(client, userdata, flags, rc):
             alerts.append(("ERROR", f"[MQTT] Errore connessione (rc={rc})"))
 
 def on_mqtt_message(client, userdata, msg):
+    """
+    MQTT 消息回调：解析告警 JSON 并加入告警队列
+    Topic 格式: ugrid/alerts/{level}/{ugrid_id}/{battery_index}
+    """
     try:
         payload = json.loads(msg.payload.decode("utf-8"))
     except Exception:
@@ -83,6 +123,10 @@ def on_mqtt_message(client, userdata, msg):
         alerts.append((level, text))
 
 def start_mqtt_listener():
+    """
+    启动 MQTT 告警监听器（独立线程）
+    返回: mqtt.Client 对象，连接失败返回 None
+    """
     client = mqtt.Client()
     client.on_connect = on_mqtt_connect
     client.on_message = on_mqtt_message
@@ -99,10 +143,14 @@ def start_mqtt_listener():
     return client
 
 # ---------------------------------------------------------------------------
-# THREAD DI POLLING STATO
+# 状态轮询线程
 # ---------------------------------------------------------------------------
 
 def poll_status_loop():
+    """
+    定时轮询 RCA /api/status 接口，更新共享状态数据
+    运行在独立线程中，每 STATUS_REFRESH_INTERVAL 秒执行一次
+    """
     while not stop_event.is_set():
         try:
             data = rca_get("/api/status")
@@ -115,27 +163,38 @@ def poll_status_loop():
         time.sleep(STATUS_REFRESH_INTERVAL)
 
 # ---------------------------------------------------------------------------
-# UTILITY PER COLORI / ETA
+# 颜色和工具函数
 # ---------------------------------------------------------------------------
 
 def init_colors():
+    """
+    初始化 curses 颜色对：
+      1: 绿色（正常/OK）
+      2: 黄色（WARNING）
+      3: 红色（CRITICAL）
+      4: 青色（标题/标签）
+      5: 品红（命令/状态行）
+      6: 蓝色（负载/PV/电网信息）
+    """
     curses.start_color()
     curses.use_default_colors()
 
-    curses.init_pair(1, curses.COLOR_GREEN, -1)   # OK
-    curses.init_pair(2, curses.COLOR_YELLOW, -1)  # WARNING
-    curses.init_pair(3, curses.COLOR_RED, -1)     # CRITICAL
-    curses.init_pair(4, curses.COLOR_CYAN, -1)    # TITLE / LABEL
-    curses.init_pair(5, curses.COLOR_MAGENTA, -1) # COMMAND / STATUS
-    curses.init_pair(6, curses.COLOR_BLUE, -1)    # LOAD/PV/Grid
+    curses.init_pair(1, curses.COLOR_GREEN, -1)
+    curses.init_pair(2, curses.COLOR_YELLOW, -1)
+    curses.init_pair(3, curses.COLOR_RED, -1)
+    curses.init_pair(4, curses.COLOR_CYAN, -1)
+    curses.init_pair(5, curses.COLOR_MAGENTA, -1)
+    curses.init_pair(6, curses.COLOR_BLUE, -1)
 
 def draw_header(stdscr, max_x):
+    """绘制顶部标题"""
     title = "Smart LBSS"
     stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
     stdscr.addstr(0, max_x // 2 - len(title) // 2, title)
     stdscr.attroff(curses.color_pair(4) | curses.A_BOLD)
 
 def soc_color_pair(soc: Optional[float]) -> int:
+    """SoC 颜色：≥70% 绿色，≥30% 黄色，<30% 红色"""
     if soc is None:
         return 0
     if soc >= 0.7:
@@ -145,6 +204,7 @@ def soc_color_pair(soc: Optional[float]) -> int:
     return 3
 
 def temp_color_pair(temp: Optional[float]) -> int:
+    """温度颜色：≤45°C 绿色，≤55°C 黄色，>55°C 红色"""
     if temp is None:
         return 0
     if temp > 55.0:
@@ -154,6 +214,7 @@ def temp_color_pair(temp: Optional[float]) -> int:
     return 1
 
 def soh_color_pair(soh: Optional[float]) -> int:
+    """SoH 颜色：≥90% 绿色，≥75% 黄色，<75% 红色"""
     if soh is None:
         return 0
     if soh >= 0.9:
@@ -163,12 +224,13 @@ def soh_color_pair(soh: Optional[float]) -> int:
     return 3
 
 def power_flow_symbol(p: Optional[float]) -> str:
+    """功率流向符号：← 充电，→ 放电，· 空闲"""
     if p is None:
         return "?"
     if p > 0.05:
-        return "←"  # batteria assorbe (carica)
+        return "←"  # 电池吸收功率（充电）
     if p < -0.05:
-        return "→"  # batteria eroga (scarica)
+        return "→"  # 电池释放功率（放电）
     return "·"
 
 def estimate_eta_seconds(
@@ -178,6 +240,16 @@ def estimate_eta_seconds(
     obj_tgt: Optional[float],
     energy_kwh: float = BATTERY_ENERGY_KWH,
 ) -> Optional[int]:
+    """
+    估算到达目标 SoC 所需时间（秒）
+    
+    参数：
+      soc: 当前 SoC
+      power_kw: 当前功率（>0 充电，<0 放电）
+      obj_mode: 控制模式（full_discharge / target_soc）
+      obj_tgt: 目标 SoC
+      energy_kwh: 电池总能量（kWh）
+    """
     if soc is None or power_kw is None or abs(power_kw) < 0.01:
         return None
 
@@ -192,7 +264,7 @@ def estimate_eta_seconds(
     if abs(delta) < 1e-3:
         return 0
 
-    # power_kw > 0 → carica, power_kw < 0 → scarica
+    # 功率方向与目标方向不一致时无法估算
     if (delta > 0 and power_kw <= 0) or (delta < 0 and power_kw >= 0):
         return None
 
@@ -201,6 +273,7 @@ def estimate_eta_seconds(
     return int(time_h * 3600)
 
 def format_eta(eta_sec: Optional[int]) -> str:
+    """格式化 ETA 时间为可读字符串（如 "5m", "2h30", "done"）"""
     if eta_sec is None:
         return "n/a"
     if eta_sec <= 0:
@@ -215,15 +288,15 @@ def format_eta(eta_sec: Optional[int]) -> str:
     return f"{int(h)}h+"
 
 # ---------------------------------------------------------------------------
-# TABLE LAYOUT (fixed widths)
+# 表格布局（固定宽度）
 # ---------------------------------------------------------------------------
 
 TABLE_HEADER = " idx |  SoC% |  SoH% | Temp |   P[kW] |  u*[kW] |  St |   Obj    |  ETA  | ts"
 TABLE_SEP = "-" * len(TABLE_HEADER)
 
-OFF_SOC  = 6    # start of SoC cell
-OFF_SOH  = 14   # start of SoH cell
-OFF_TEMP = 22   # start of Temp cell
+OFF_SOC  = 6    # SoC 单元格起始列偏移
+OFF_SOH  = 14   # SoH 单元格起始列偏移
+OFF_TEMP = 22   # Temp 单元格起始列偏移
 
 ROW_FMT = (
     "{idx:>4} |"
@@ -239,10 +312,16 @@ ROW_FMT = (
 )
 
 # ---------------------------------------------------------------------------
-# RENDERING TUI
+# TUI 渲染
 # ---------------------------------------------------------------------------
 
 def draw_status_panel(stdscr, start_y, max_y, max_x):
+    """
+    绘制状态面板：
+      - 每个 uGrid 的标题
+      - PV/Load/Grid 能量流信息
+      - 每块电池的表格行（SoC/SoH/温度/功率/控制目标/ETA）
+    """
     y = start_y
 
     with status_data_lock:
@@ -262,7 +341,7 @@ def draw_status_panel(stdscr, start_y, max_y, max_x):
         profit_rate = info.get("profit_eur_per_hour")
         price = info.get("price_eur_per_kwh")
 
-        # header uGrid
+        # uGrid 标题
         title = f"uGrid {ugrid_id}"
         stdscr.attron(curses.color_pair(4) | curses.A_BOLD)
         stdscr.addstr(y, 2, title)
@@ -271,7 +350,7 @@ def draw_status_panel(stdscr, start_y, max_y, max_x):
         x_info = 2 + len(title) + 2
         line_used = 1
 
-        # PV / Load / Grid line (aligned after title)
+        # PV / Load / Grid 行
         if load_kw is not None and pv_kw is not None and x_info < max_x - 2:
             stdscr.attron(curses.color_pair(6))
             s = f"☀ PV: {pv_kw:.2f} kW   ⚡ Load: {load_kw:.2f} kW"
@@ -290,16 +369,16 @@ def draw_status_panel(stdscr, start_y, max_y, max_x):
             stdscr.attroff(curses.color_pair(6))
             line_used += 1
 
-        # €/h line (aligned under the PV/Load/Grid line)
+        # 收益/小时行
         if grid_kw is not None and profit_rate is not None and price is not None:
             py = y + 1
             if py < max_y - 5 and x_info < max_x - 2:
                 if profit_rate < 0:
-                    cp = 3
+                    cp = 3  # 红色（亏损）
                 elif profit_rate > 0:
-                    cp = 1
+                    cp = 1  # 绿色（盈利）
                 else:
-                    cp = 2
+                    cp = 2  # 黄色（持平）
                 stdscr.attron(curses.color_pair(cp))
                 s2 = f"€/h: {profit_rate:+.3f}   (price ≈ {price:.3f} €/kWh)"
                 stdscr.addstr(py, x_info, s2[: max_x - x_info - 1])
@@ -308,7 +387,7 @@ def draw_status_panel(stdscr, start_y, max_y, max_x):
 
         y += line_used
 
-        # Battery table header
+        # 电池表格表头
         stdscr.addstr(y, 4, TABLE_HEADER[: max_x - 8])
         y += 1
         stdscr.addstr(y, 4, TABLE_SEP[: max_x - 8])
@@ -331,6 +410,7 @@ def draw_status_panel(stdscr, start_y, max_y, max_x):
             obj_mode = b.get("objective_mode")
             obj_tgt = b.get("objective_target_soc")
 
+            # 控制目标缩写
             if obj_mode == "full_discharge":
                 obj_str = "FD"
             elif obj_mode == "target_soc" and obj_tgt is not None:
@@ -366,25 +446,22 @@ def draw_status_panel(stdscr, start_y, max_y, max_x):
                 ts=ts,
             )
 
-            # Print base line
+            # 打印基础行
             stdscr.addstr(y, 4, line[: max_x - 8])
 
-            # Re-apply colors on SoC/SoH/Temp cells (fixed offsets)
-            # SoC
+            # 在 SoC/SoH/Temp 单元格上叠加颜色
             scp = soc_color_pair(soc)
             if scp:
                 stdscr.attron(curses.color_pair(scp) | curses.A_BOLD)
                 stdscr.addstr(y, 4 + OFF_SOC, f"{soc_str:>6}"[:6])
                 stdscr.attroff(curses.color_pair(scp) | curses.A_BOLD)
 
-            # SoH
             shp = soh_color_pair(soh)
             if shp:
                 stdscr.attron(curses.color_pair(shp))
                 stdscr.addstr(y, 4 + OFF_SOH, f"{soh_str:>6}"[:6])
                 stdscr.attroff(curses.color_pair(shp))
 
-            # Temp
             tp = temp_color_pair(temp)
             if tp:
                 stdscr.attron(curses.color_pair(tp))
@@ -393,11 +470,12 @@ def draw_status_panel(stdscr, start_y, max_y, max_x):
 
             y += 1
 
-        y += 1  # spazio tra ugrid
+        y += 1  # uGrid 之间的间距
 
     return y
 
 def draw_alerts_panel(stdscr, start_y, max_y, max_x):
+    """绘制告警面板：显示最近的 MQTT 和 RCA 告警"""
     y = start_y
     if y >= max_y - 4:
         return y
@@ -437,6 +515,7 @@ def draw_alerts_panel(stdscr, start_y, max_y, max_x):
     return y
 
 def draw_command_line(stdscr, cmd_buffer: str, status_msg: str):
+    """绘制底部命令行和状态消息"""
     max_y, max_x = stdscr.getmaxyx()
     y_status = max_y - 3
     y_cmd = max_y - 2
@@ -462,7 +541,7 @@ def draw_command_line(stdscr, cmd_buffer: str, status_msg: str):
     stdscr.move(y_cmd, 2 + len(prompt) + len(visible))
 
 # ---------------------------------------------------------------------------
-# PARSING COMANDI
+# 命令解析和执行
 # ---------------------------------------------------------------------------
 
 HELP_TEXT = (
@@ -478,6 +557,10 @@ HELP_TEXT = (
 )
 
 def run_command(cmd: str) -> Tuple[str, bool]:
+    """
+    解析并执行用户输入的命令
+    返回: (状态消息, 是否退出)
+    """
     parts = cmd.strip().split()
     if not parts:
         return "", False
@@ -566,10 +649,18 @@ def run_command(cmd: str) -> Tuple[str, bool]:
         return f"Errore eseguendo '{c}': {e}", False
 
 # ---------------------------------------------------------------------------
-# MAIN CURSES LOOP
+# Curses 主循环
 # ---------------------------------------------------------------------------
 
 def tui_main(stdscr):
+    """
+    TUI 主循环：
+      1. 刷新屏幕
+      2. 绘制状态面板（电池表格）
+      3. 绘制告警面板
+      4. 绘制命令行
+      5. 处理键盘输入
+    """
     curses.curs_set(1)
     stdscr.nodelay(True)
     stdscr.timeout(200)
@@ -615,6 +706,12 @@ def tui_main(stdscr):
     stop_event.set()
 
 def main():
+    """
+    启动流程：
+      1. 启动状态轮询线程
+      2. 启动 MQTT 告警监听
+      3. 进入 curses TUI 主循环
+    """
     poller = threading.Thread(target=poll_status_loop, daemon=True)
     poller.start()
 
