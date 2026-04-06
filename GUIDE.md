@@ -390,8 +390,8 @@ source .venv/bin/activate
 │  Border Router → uGridCtrl → BatCtrl        │
 │  (CoAP over 6LoWPAN/RPL)                     │
 └──────────────────┬──────────────────────────┘
-                   │ CoAP over IPv6
-                   ▼
+                    │ CoAP over IPv6
+                    ▼
 ┌─────────────────────────────────────────────┐
 │  RCA (RCA/rca.py)                            │
 │  - Flask REST API :3000                      │
@@ -399,14 +399,44 @@ source .venv/bin/activate
 │  - MQTT 告警                                  │
 │  - CoAP 客户端（连接设备）                      │
 └──────────────────┬──────────────────────────┘
-                   │ HTTP REST
-                   ▼
+                    │ HTTP REST
+                    ▼
 ┌─────────────────────────────────────────────┐
 │  CA (CA/client_application.py)               │
 │  - 终端 TUI 界面                              │
 │  - 实时监控 + 控制命令                         │
 └─────────────────────────────────────────────┘
 ```
+
+### 通信协议说明
+
+| 层级 | 协议 | 用途 |
+|------|------|------|
+| BatteryController → uGridController | CoAP OBSERVE | 实时上报 SoC/SoH/电压/电流/温度 |
+| uGridController → RCA | CoAP GET /dev/state | 周期性获取聚合状态（CBOR 编码） |
+| RCA → MySQL | 直接写入 | 存储遥测数据、控制目标、MPC 参数 |
+| RCA → Mosquitto | MQTT | **仅告警事件**（解耦下游通知系统） |
+| RCA → CA | HTTP REST | 提供状态查询、电池控制 API |
+
+### Mosquitto (MQTT) 用途澄清
+
+- **用途**：仅用于**告警信息解耦**，不是数据上报通道
+- **Topic 格式**：`ugrid/alerts/{level}/{ugrid_id}/{battery_index}`
+  - `{level}`: `critical` / `warning` / `info`
+- **消息发布者**：RCA（当触发告警条件时）
+- **消息订阅者**：外部系统（如运维监控、短信通知等）
+- **告警触发条件**：
+  - `critical`: SoH < 80% 或 温度 > 50°C
+  - `warning`: SoC < 15%
+  - `info`: 控制目标完成事件（如放电完成、达到目标 SoC）
+
+> **注意**：电池状态数据（SoC/SOH/电压等）通过 CoAP 传输，**不使用 MQTT**。MQTT 仅作为告警广播通道，实现告警通知与业务逻辑解耦。
+
+### 削峰填谷实现
+
+- **不是 MQTT**：MQTT 仅负责告警广播
+- **削峰填谷**由 **uGridController 的 MPC（模型预测控制）算法**实现
+- MPC 根据电价、PV 预测、负载预测，计算每块电池的最优充放电功率
 
 ## 不使用 Cooja 时
 
