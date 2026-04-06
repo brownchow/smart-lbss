@@ -410,13 +410,52 @@ source .venv/bin/activate
 
 ### 通信协议说明
 
-| 层级 | 协议 | 用途 |
-|------|------|------|
-| BatteryController → uGridController | CoAP OBSERVE | 实时上报 SoC/SoH/电压/电流/温度 |
-| uGridController → RCA | CoAP GET /dev/state | 周期性获取聚合状态（CBOR 编码） |
+| 通信方向 | 协议 | 描述 |
+|----------|------|------|
+| BatteryController → uGridController | **CoAP OBSERVE** | 电池主动订阅 /dev/state，实时推送 SoC/SoH/电压/电流/温度 |
+| uGridController → BatteryController | **CoAP PUT /dev/power** | uGridController 向电池下发功率指令 |
+| BatteryController → uGridController | **CoAP POST /dev/register** | 电池启动时向 uGridController 注册 |
+| uGridController → RCA | **CoAP GET /dev/state** | RCA 每 5 秒拉取微电网聚合状态（CBOR 编码） |
+| RCA → uGridController | **CoAP PUT /ctrl/obj** | RCA 向 uGridController 设置电池手动功率目标 |
 | RCA → MySQL | 直接写入 | 存储遥测数据、控制目标、MPC 参数 |
 | RCA → Mosquitto | MQTT | **仅告警事件**（解耦下游通知系统） |
 | RCA → CA | HTTP REST | 提供状态查询、电池控制 API |
+
+### 数据流向图
+
+```
+                    ┌─────────────────────┐
+                    │   Border Router     │  (RPL 边界路由，IPv6 6LoWPAN 核心)
+                    │   (fd00::1)         │
+                    └──────────┬──────────┘
+                               │ RPL/6LoWPAN
+                               ▼
+┌─────────────┐    OBSERVE    ┌─────────────────────┐
+│ BatteryCtrl │ ─────────────▶│   uGridController   │
+│ (fd00::x)   │ ◀─────────────│   (聚合层大脑)       │
+│             │   PUT /power  │                     │
+└─────────────┘               └──────────┬──────────┘
+                                         │ GET /dev/state (每5秒)
+                                         ▼
+                                  ┌─────────────────────┐
+                                  │   RCA (云端层)      │
+                                  │  CoAP Client        │
+                                  │  Flask :3000        │
+                                  └──────────┬──────────┘
+                                             │ HTTP REST / MQTT
+                                             ▼
+                                  ┌─────────────────────┐
+                                  │   CA (客户端)       │
+                                  └─────────────────────┘
+```
+
+### 各组件角色
+
+- **Border Router**: RPL 协议边界路由器，提供 IPv6 网络连通性
+- **BatteryController**: CoAP 服务器，提供 /dev/state（电池状态）、/dev/power（功率指令）
+- **uGridController**: CoAP 客户端（OBSERVE 订阅电池）+ CoAP 服务器（提供 /dev/state 给 RCA）
+- **RCA**: CoAP 客户端（拉取 uGridController）+ Flask 服务器（提供 REST API）
+- **CA**: HTTP 客户端（调用 RCA API）+ MQTT 订阅者（可选，接收告警） |
 
 ### Mosquitto (MQTT) 用途澄清
 
