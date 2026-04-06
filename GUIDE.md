@@ -397,7 +397,7 @@ source .venv/bin/activate
 │  - Flask REST API :3000                      │
 │  - MySQL 存储                                 │
 │  - MQTT 告警                                  │
-│  - CoAP 客户端（连接设备）                      │
+│  - CoAP 客户端（定时拉取 uGridController 状态）│
 └──────────────────┬──────────────────────────┘
                     │ HTTP REST
                     ▼
